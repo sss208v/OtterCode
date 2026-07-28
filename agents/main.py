@@ -81,9 +81,10 @@ def _clean_env(value: str | None) -> str | None:
 def _load_env_file() -> None:
     env_path = find_dotenv(usecwd=True)
     if env_path:
-        load_dotenv(env_path, override=False)
+        # override=True：项目 .env 中的显式配置优先于系统残留环境变量（如全局 MODEL）。
+        load_dotenv(env_path, override=True)
     else:
-        load_dotenv(override=False)
+        load_dotenv(override=True)
 
 
 def _is_anthropic_compatible_base_url(base_url: str | None) -> bool:
@@ -335,7 +336,7 @@ Options:
   --accept-edits      Auto-approve file edits, still confirm dangerous shell
   --dont-ask          Auto-deny anything needing confirmation (for CI)
   --thinking          Enable extended thinking (Anthropic only)
-  --model, -m         Model to use (default: deepseek-chat, or MODEL env)
+  --model, -m         Model to use (default: deepseek-v4-pro, or MODEL env)
   --api-base URL      Override API base URL from CLI or .env
   --resume            Resume the last session
   --max-cost USD      Stop when estimated cost exceeds this amount
@@ -371,7 +372,7 @@ Examples:
     # 将命令行布尔开关统一转换成 Agent 内部使用的权限模式。
     permission_mode = _resolve_permission_mode(args)
     # 模型优先使用命令行参数，其次读取 .env 中的 MODEL，最后回落到默认模型。
-    model = args.model or os.environ.get("MODEL") or "deepseek-chat"
+    model = args.model or os.environ.get("MODEL") or "deepseek-v4-pro"
     resolved_api_base, resolved_api_key, resolved_use_openai = _resolve_api_config(args.api_base)
 
     # 没有可用 API key 时无法调用模型，直接提示配置方式并退出。

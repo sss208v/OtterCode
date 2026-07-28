@@ -105,7 +105,7 @@ tool_definitions: list[ToolDef] = [
     },
     {
         "name": "run_shell",
-        "description": "Execute a shell command and return its output. Use this for running tests, installing packages, git operations, etc.",
+        "description": "Execute a shell command and return its output. Use this for running tests, installing packages, git operations, etc. Reserve this exclusively for system commands and terminal operations that require shell execution. For file operations, always use the dedicated tools instead: read_file (not cat/head/tail/sed), edit_file (not sed/awk), write_file (not echo redirection or heredoc), list_files (not find/ls), grep_search (not grep/rg). Dedicated tools allow the user to better understand and review your work.",
         "input_schema": {
             "type": "object",
             "properties": {

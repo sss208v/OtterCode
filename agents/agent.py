@@ -78,7 +78,9 @@ MODEL_CONTEXT = {
     "claude-opus-4-20250514": 200000,
     "gpt-4o": 128000,
     "gpt-4o-mini": 128000,
-    "deepseek-chat":200000
+    "deepseek-chat":200000,
+    "deepseek-v4-flash": 1000000,
+    "deepseek-v4-pro": 1000000
 }
 
 def _get_context_windows(model:str)->int:

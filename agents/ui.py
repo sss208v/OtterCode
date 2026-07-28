@@ -13,6 +13,16 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+# 终端编码兜底：GBK 等非 UTF-8 终端无法编码 spinner 盲文字符等输出会抛
+# UnicodeEncodeError。保留终端原编码（中文仍正常显示），仅将无法编码的
+# 字符降级为 ?，避免崩溃。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if _stream.encoding and "utf" not in _stream.encoding.lower():
+            _stream.reconfigure(errors="replace")
+    except Exception:
+        pass  # 重定向管道等不支持 reconfigure 的流，保持原样
+
 console = Console(highlight=False)
 
 # ─── Basic output ──────────────────────────────────────────
