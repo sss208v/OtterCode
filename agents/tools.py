@@ -16,12 +16,12 @@ ToolDef = dict  # Anthropic tool schema dict
 #权限模式
 PermissionMode = str  # "default" | "plan" | "acceptEdits" | "bypassPermissions" | "dontAsk"
 
-READ_TOOLS = {"read_file", "list_files", "grep_search"}
+READ_TOOLS = {"read_file", "list_files", "grep_search", "file_stats"}
 EDIT_TOOLS = {"write_file", "edit_file", "skill_evolve", "skill_create"}
 
 
 #并发安全的工具可以并行运行（只读，无副作用）
-CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search"}
+CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search", "file_stats"}
 
 
 
@@ -49,6 +49,17 @@ tool_definitions: list[ToolDef] = [
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "The path to the file to read"},
+            },
+            "required": ["file_path"],
+        },
+    },
+    {
+        "name": "file_stats",
+        "description": "Get statistics for a file: line count, character count, and size in bytes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "The path to the file to inspect"},
             },
             "required": ["file_path"],
         },
@@ -366,6 +377,24 @@ def _list_files(inp: dict) -> str:
         return result
     except Exception as e:
         return f"Error listing files: {e}"
+
+
+# 文件统计：行数/字符数/字节大小。失败返回可读错误字符串，不抛异常。
+def _file_stats(inp: dict) -> str:
+    try:
+        p = _resolve_tool_path(inp["file_path"])
+        content = p.read_text(encoding="utf-8", errors="replace")
+        lines = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
+        return (
+            f"File: {p}\n"
+            f"Lines: {lines}\n"
+            f"Characters: {len(content)}\n"
+            f"Size: {p.stat().st_size} bytes"
+        )
+    except FileNotFoundError:
+        return f"Error: File not found: {inp.get('file_path', '')}"
+    except Exception as e:
+        return f"Error: {e}"
 
 
 def _grep_search(inp: dict) -> str:
@@ -741,6 +770,7 @@ async def execute_tool(
         "edit_file": _edit_file,
         "list_files": _list_files,
         "grep_search": _grep_search,
+        "file_stats": _file_stats,
         "run_shell": _run_shell,
     }
     handler = handlers.get(name)
