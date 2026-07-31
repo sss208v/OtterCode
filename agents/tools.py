@@ -9,9 +9,10 @@ import re
 import subprocess
 from pathlib import Path
 
-from tqdm.utils import IS_WIN
-
 from agents.memory import get_memory_dir
+
+# Windows 平台判断只依赖标准库，保证 AGENTS.md 中"验证命令只依赖标准库"的断言成立
+IS_WIN = os.name == "nt"
 
 ToolDef = dict  # Anthropic tool schema dict
 #权限模式
@@ -463,7 +464,7 @@ def _grep_search(inp: dict) -> str:
             args.extend(["--", pattern, path])
 
             result = subprocess.run(
-                args, capture_output=True, text=True, timeout=10
+                args, capture_output=True, text=True, timeout=10, encoding="utf-8", errors="replace"
             )
             if result.returncode == 1:
                 return "No matches found."
@@ -573,6 +574,8 @@ def _run_shell(inp: dict) -> str:
             capture_output=True,
             text=True,
             timeout=timeout_s,
+            encoding="utf-8",
+            errors="replace"
         )
         output = result.stdout or ""
         if result.returncode != 0:

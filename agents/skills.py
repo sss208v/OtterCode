@@ -114,7 +114,7 @@ def _load_skills_from_dir( base_dir: Path, source: str, skills:dict[str, SkillDe
 def _parse_skill_file(file_path: Path, source: str, skill_dir: str) -> SkillDefinition:
     try:
         # SKILL.md = frontmatter 配置 + markdown 正文。
-        raw = file_path.read_text(encoding="utf-8")
+        raw = file_path.read_text(encoding="utf-8", errors="replace")
         result = parse_frontmatter(raw)
         meta = result.meta
 
