@@ -1,5 +1,5 @@
 ---
-name: code_review
+name: code-review
 description: Review code for bugs, security issues, regressions, maintainability risks, and missing tests.
 user-invocable: false
 when-to-use: Use when the user asks to review code, code review a file or diff, inspect code quality, find bugs, identify security issues, evaluate maintainability, or check for missing tests.
