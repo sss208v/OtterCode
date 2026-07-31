@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import os
 import re
 import subprocess
@@ -226,6 +227,52 @@ tool_definitions: list[ToolDef] = [
 
 
 
+#----------------------工具失败日志----------------------------
+# 工具失败写入 .otter/logs/tools.log，留下可归因的持久记录；
+# 日志只做旁路观测，工具对模型仍返回可读错误字符串，契约不变。
+
+logger = logging.getLogger("otter.tools")
+
+
+def _ensure_tool_logger() -> None:
+    if any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        return
+    try:
+        log_dir = Path.cwd() / ".otter" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(log_dir / "tools.log", encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        logger.addHandler(handler)
+        if logger.level == logging.NOTSET:
+            logger.setLevel(logging.INFO)
+        logger.propagate = False
+    except Exception:
+        pass  # 日志设施不可用时退回默认 logging 行为，不影响工具执行
+
+
+def _summarize_input(inp: dict) -> str:
+    try:
+        summary = json.dumps(inp, ensure_ascii=False, default=str)
+    except Exception:
+        summary = repr(inp)
+    return summary if len(summary) <= 200 else summary[:200] + "...(truncated)"
+
+
+def _log_tool_failure(tool_name: str, inp: dict, exc: BaseException, *, level: int = logging.WARNING) -> None:
+    try:
+        _ensure_tool_logger()
+        logger.log(
+            level,
+            "tool=%s input=%s error=%s: %s",
+            tool_name,
+            _summarize_input(inp),
+            type(exc).__name__,
+            exc,
+        )
+    except Exception:
+        pass  # 记录失败不能影响工具返回契约
+
+
 #----------------------工具调用----------------------------
 
 def _resolve_tool_path(raw_path: str, *, must_exist: bool = True) -> Path:
@@ -254,6 +301,7 @@ def _read_file(inp:dict) -> str:
         numbered = "\n".join(f"{i + 1:4d} | {line}" for i, line in enumerate(lines))
         return numbered
     except Exception as e:
+        _log_tool_failure("read_file", inp, e)
         return f"Error reading file: {e}"
 
 def _write_file(inp:dict) -> str:
@@ -268,6 +316,7 @@ def _write_file(inp:dict) -> str:
         trunc = f"\n  ... ({line_count} lines total)" if line_count > 30 else ""
         return f"Successfully wrote to {inp['file_path']} ({line_count} lines)\n\n{preview}{trunc}"
     except Exception as e:
+        _log_tool_failure("write_file", inp, e)
         return f"Error writing file: {e}"
 
 def _auto_update_memory_index(file_path:str) -> None:
@@ -289,11 +338,11 @@ def _auto_update_memory_index(file_path:str) -> None:
                         t = type_match.group(1).strip()
                         d = desc_match.group(1).strip()
                         lines.append(f"- **[{n}]({f.name})** ({t}) — {d}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log_tool_failure("write_file", {"memory_index_entry": str(f)}, e)
             (mem_path / "MEMORY.md").write_text("\n".join(lines))
-    except Exception:
-        pass
+    except Exception as e:
+        _log_tool_failure("write_file", {"memory_index_for": file_path}, e)
 
 #-------------------------编辑助手，符号规范化+差异化------------------------
 
@@ -351,6 +400,7 @@ def _edit_file(inp: dict) -> str:
 
         return f"Successfully edited {inp['file_path']}{quote_note}\n\n{diff}"
     except Exception as e:
+        _log_tool_failure("edit_file", inp, e)
         return f"Error editing file: {e}"
 
 
@@ -376,6 +426,7 @@ def _list_files(inp: dict) -> str:
             result += f"\n...and {len(files) - 200} more files are found ..."
         return result
     except Exception as e:
+        _log_tool_failure("list_files", inp, e)
         return f"Error listing files: {e}"
 
 
@@ -391,9 +442,11 @@ def _file_stats(inp: dict) -> str:
             f"Characters: {len(content)}\n"
             f"Size: {p.stat().st_size} bytes"
         )
-    except FileNotFoundError:
+    except FileNotFoundError as e:
+        _log_tool_failure("file_stats", inp, e, level=logging.INFO)
         return f"Error: File not found: {inp.get('file_path', '')}"
     except Exception as e:
+        _log_tool_failure("file_stats", inp, e)
         return f"Error: {e}"
 
 
@@ -420,8 +473,9 @@ def _grep_search(inp: dict) -> str:
                 if len(lines) >100:
                     output += f"\n... and {len(lines) - 100} more matches"
                 return output
-        except Exception:
-            pass
+        except Exception as e:
+            # 系统 grep 不可用属预期回退，记 INFO 便于归因
+            _log_tool_failure("grep_search", inp, e, level=logging.INFO)
 
     return _grep_python(pattern, path, include)
 
@@ -436,7 +490,8 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
             return
         try:
             entries = os.listdir(d)
-        except Exception:
+        except Exception as e:
+            _log_tool_failure("grep_search", {"pattern": pattern, "path": d}, e, level=logging.DEBUG)
             return
         for name in entries:
             if name.startswith(".") or name == "node_modules":
@@ -454,8 +509,8 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
                         matches.append(f"{full}:{i+1}:{line}")
                         if len(matches) >= 200:
                             return
-            except Exception:
-                pass
+            except Exception as e:
+                _log_tool_failure("grep_search", {"pattern": pattern, "file": full}, e, level=logging.DEBUG)
 
     walk(directory)
     if not matches:
@@ -525,9 +580,11 @@ def _run_shell(inp: dict) -> str:
             stdout = f"\nStdout: {result.stdout}" if result.stdout else ""
             return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
         return output or "(no output)"
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
+        _log_tool_failure("run_shell", inp, e)
         return f"Command timed out after {inp.get('timeout', 30000)}ms"
     except Exception as e:
+        _log_tool_failure("run_shell", inp, e)
         return f"Error: {e}"
 
 
@@ -566,7 +623,8 @@ def _load_settings(file_path: Path) -> dict | None:
         return None
     try:
         return json.loads(file_path.read_text())
-    except Exception:
+    except Exception as e:
+        _log_tool_failure("load_settings", {"file": str(file_path)}, e)
         return None
 
 _cached_rules: dict | None = None

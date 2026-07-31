@@ -229,7 +229,11 @@ analysis_progress.md
 
 # IDE / OS
 .idea/
+.qoder/
 .DS_Store
+
+# Local plan drafts
+plan-*.md
 
 # Personal learning materials (local only)
 OtterCode*.html
