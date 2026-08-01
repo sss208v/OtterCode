@@ -225,6 +225,23 @@ async def maintain_online_skill_candidate(
             when_to_use=str(decision.get("merged_when_to_use") or candidate.when_to_use),
             tags=candidate.tags,
         )
+        if not result.get("ok") and result.get("suggest_split"):
+            # SkillsBench 聚焦原则：目标 skill 指令已膨胀，拆分为新 skill 而非继续 append。
+            split_result = create_skill(
+                name=candidate.name,
+                description=candidate.description,
+                instructions=candidate.instructions,
+                when_to_use=candidate.when_to_use,
+                target=target,
+                context="inline",
+                user_invocable=False,
+                evidence=candidate.evidence,
+                actor="online",
+                tags=candidate.tags,
+            )
+            if split_result.get("ok"):
+                return {"action": "add", "candidate": asdict(candidate), "decision": decision, **split_result}
+            result["split_fallback_error"] = str(split_result.get("error") or "")
         return {"action": "merge", "candidate": asdict(candidate), "decision": decision, **result}
 
     result = create_skill(
@@ -250,6 +267,7 @@ async def online_ingest(
     hint: str = "",
     confirm_write: ConfirmWrite | None = None,
     target: str = "project",
+    trace_id: str = "",
 ) -> dict[str, Any]:
     from .skills import record_online_provenance
 
@@ -268,6 +286,7 @@ async def online_ingest(
             messages=messages,
             retrieved_reference=retrieved_reference,
             error=str(exc),
+            trace_id=trace_id,
         )
         return result
 
@@ -278,6 +297,7 @@ async def online_ingest(
             result=result,
             messages=messages,
             retrieved_reference=retrieved_reference,
+            trace_id=trace_id,
         )
         return result
 
@@ -300,6 +320,7 @@ async def online_ingest(
         retrieved_reference=retrieved_reference,
         decision=result.get("decision") if isinstance(result.get("decision"), dict) else None,
         error="" if result.get("ok") else str(result.get("error") or ""),
+        trace_id=trace_id,
     )
     return result
 

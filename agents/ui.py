@@ -350,6 +350,42 @@ def print_skill_entries(skills: list[object]) -> None:
     console.print(Panel(table, title="[bold cyan]Skills[/bold cyan]", border_style="cyan", box=box.ROUNDED))
 
 
+_JOURNEY_EVENT_STYLE = {
+    "create": "bold green",
+    "invoke": "cyan",
+    "feedback": "magenta",
+    "evolve": "yellow",
+    "snapshot": "dim",
+    "promote": "bold green",
+    "prune": "red",
+    "trace_evolution": "blue",
+    "online_ingest": "blue",
+    "eval": "dim",
+}
+
+
+def print_skill_journey(entries: list[object]) -> None:
+    # 技能演化时间线（/journey）：按时间聚合 create/invoke/feedback/evolve/eval/promote/prune。
+    if not entries:
+        print_info("No skill journey entries found yet.")
+        return
+    table = Table(box=box.ROUNDED, header_style="bold cyan", border_style="cyan")
+    table.add_column("Time (UTC)", style="dim", no_wrap=True)
+    table.add_column("Event", style="bold", no_wrap=True)
+    table.add_column("Skill", style="#f6c177", no_wrap=True)
+    table.add_column("Summary", style="white")
+    for entry in reversed(list(entries)[-80:]):
+        event = str(getattr(entry, "get", lambda k, d="": d)("event", "") or "")
+        style = _JOURNEY_EVENT_STYLE.get(event, "white")
+        table.add_row(
+            _safe_text(str(getattr(entry, "get", lambda k, d="": d)("time", "") or "")),
+            f"[{style}]{_safe_text(event)}[/{style}]",
+            _safe_text(str(getattr(entry, "get", lambda k, d="": d)("skill", "") or "")),
+            _safe_text(str(getattr(entry, "get", lambda k, d="": d)("summary", "") or "")),
+        )
+    console.print(Panel(table, title="[bold cyan]Skill Journey[/bold cyan]", border_style="cyan", box=box.ROUNDED))
+
+
 # ─── Tool icons and summaries ───────────────────────────────
 
 _TOOL_ICONS = {

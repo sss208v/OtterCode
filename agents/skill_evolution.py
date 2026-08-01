@@ -17,6 +17,9 @@ ONLINE_PROVENANCE_LOG = "online_provenance.jsonl"
 ONLINE_PROVENANCE_INDEX = "online_skill_provenance.json"
 SKILL_USAGE_STATS = "skill_usage_stats.json"
 HISTORY_DIR = "history"
+TRACES_DIR = "traces"
+# SkillsBench 聚焦原则：指令超过该长度时应拆分新 skill 而非继续 append。
+SKILL_MAX_INSTRUCTIONS_CHARS = 2400
 
 
 def get_evolution_dir() -> Path:
@@ -31,10 +34,38 @@ def _today() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
 
 
+def _stable_hash(value: object) -> str:
+    # 与评测系统共用同一 hash 算法（sha1 + sort_keys json），保证 trace/样本可跨模块关联。
+    return hashlib.sha1(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _read_jsonl_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def _write_jsonl_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -89,6 +120,7 @@ def record_skill_invocation(
     source: str,
     context: str,
     args: object = "",
+    trace_id: str = "",
 ) -> None:
     row = {
         "event": "invoke",
@@ -97,6 +129,7 @@ def record_skill_invocation(
         "source": source,
         "context": context,
         "args_preview": _preview(args),
+        "trace_id": str(trace_id or ""),
     }
     _append_jsonl(get_evolution_dir() / USAGE_LOG, row)
 
@@ -106,6 +139,7 @@ def record_skill_feedback(
     skill_name: str,
     rating: str,
     note: str = "",
+    trace_id: str = "",
 ) -> None:
     row = {
         "event": "feedback",
@@ -113,8 +147,169 @@ def record_skill_feedback(
         "skill": skill_name,
         "rating": str(rating or "").strip(),
         "note": _preview(note, 1200),
+        "trace_id": str(trace_id or ""),
     }
     _append_jsonl(get_evolution_dir() / USAGE_LOG, row)
+
+
+def record_skill_trace(
+    *,
+    skill_name: str,
+    trace_id: str,
+    trigger_query: str = "",
+    hit_scores: list[dict[str, Any]] | None = None,
+    messages: list[dict[str, Any]] | None = None,
+    latest_user: str = "",
+    latest_assistant: str = "",
+    session_id: str = "",
+    usage_judgment: dict[str, Any] | None = None,
+    evolution_action: str = "",
+    evolution_time: str = "",
+) -> None:
+    # 一条技能执行轨迹：窗口建立时落初始行，usage/evolution 回写时按 trace_id 合并更新。
+    # trace_id 由调用方用 _stable_hash 生成（内容哈希），同一窗口多次回写只保留一条。
+    if not trace_id:
+        return
+    path = get_evolution_dir() / TRACES_DIR / f"{_safe_skill_slug(skill_name or 'unknown')}.jsonl"
+    row = {
+        "trace_id": trace_id,
+        "skill": str(skill_name or "").strip(),
+        "time": _utc_now(),
+        "trigger_query": _preview(trigger_query, 1000),
+        "hit_scores": list(hit_scores or [])[:10],
+        "messages": _compact_messages(list(messages or [])),
+        "latest_user": _preview(latest_user, 2000),
+        "latest_assistant": _preview(latest_assistant, 4000),
+        "session_id": str(session_id or ""),
+        "usage_judgment": dict(usage_judgment or {}),
+        "evolution_action": str(evolution_action or ""),
+        "evolution_time": str(evolution_time or ""),
+    }
+    rows = _read_jsonl_rows(path)
+    idx = next((i for i, r in enumerate(rows) if r.get("trace_id") == trace_id), None)
+    if idx is not None:
+        merged = dict(rows[idx])
+        merged.update({k: v for k, v in row.items() if k != "time"})
+        merged["updated_at"] = _utc_now()
+        rows[idx] = merged
+    else:
+        rows.append(row)
+    _write_jsonl_rows(path, rows)
+
+
+def load_skill_traces(skill_name: str | None = None) -> list[dict[str, Any]]:
+    # 读取全部（或指定 skill 的）执行轨迹，按时间升序返回，供 /journey 与评测 replay 使用。
+    root = get_evolution_dir() / TRACES_DIR
+    if not root.is_dir():
+        return []
+    rows: list[dict[str, Any]] = []
+    for path in sorted(root.glob("*.jsonl")):
+        for row in _read_jsonl_rows(path):
+            if skill_name and str(row.get("skill") or "") != skill_name:
+                continue
+            rows.append(row)
+    rows.sort(key=lambda r: str(r.get("time") or ""))
+    return rows
+
+
+def _journey_event_summary(event: str, row: dict[str, Any]) -> str:
+    if event == "create":
+        return f"created v{row.get('version', '0.1.0')} ({row.get('target', '')})"
+    if event == "invoke":
+        return f"invoked (context={row.get('context', '')})"
+    if event == "feedback":
+        return f"feedback rating={row.get('rating', '')} {row.get('note', '')}"
+    if event == "evolve":
+        return f"evolved to v{row.get('version', '')} ({row.get('target', '')})"
+    if event == "prune":
+        return f"pruned to {row.get('to', '')}"
+    return ""
+
+
+def load_skill_journey(skill_name: str | None = None) -> list[dict[str, Any]]:
+    # /journey 时间线：聚合五路数据源（usage 事件、traces、online_provenance、champions 晋升、history 快照），按时间合并。
+    root = get_evolution_dir()
+    entries: list[dict[str, Any]] = []
+
+    usage_path = root / USAGE_LOG
+    for row in _read_jsonl_rows(usage_path):
+        event = str(row.get("event") or "")
+        if event not in {"create", "invoke", "feedback", "evolve", "prune"}:
+            continue
+        if skill_name and str(row.get("skill") or "") != skill_name:
+            continue
+        entries.append(
+            {
+                "time": str(row.get("time") or ""),
+                "event": event,
+                "skill": str(row.get("skill") or ""),
+                "summary": _journey_event_summary(event, row),
+            }
+        )
+
+    for trace in load_skill_traces(skill_name):
+        if trace.get("evolution_action"):
+            entries.append(
+                {
+                    "time": str(trace.get("evolution_time") or trace.get("time") or ""),
+                    "event": "trace_evolution",
+                    "skill": str(trace.get("skill") or ""),
+                    "summary": f"trace {trace.get('evolution_action')} (trace_id={str(trace.get('trace_id') or '')[:8]})",
+                }
+            )
+
+    # 在线演化来源记录（online_provenance.jsonl）：每次 online_ingest 的 action 与结果。
+    for row in _read_jsonl_rows(root / ONLINE_PROVENANCE_LOG):
+        entry_skill = str(row.get("skill") or "")
+        if skill_name and entry_skill != skill_name:
+            continue
+        if entry_skill:
+            entries.append(
+                {
+                    "time": str(row.get("time") or ""),
+                    "event": "online_ingest",
+                    "skill": entry_skill,
+                    "summary": f"online {row.get('action', '')} (ok={row.get('ok', '')}, trace_id={str(row.get('trace_id') or '')[:8]})",
+                }
+            )
+
+    champions = _read_json(root / "online-eval" / "champions.json", {})
+    champs = champions.get("champions", {}) if isinstance(champions, dict) else {}
+    if isinstance(champs, dict):
+        for item in champs.values():
+            if not isinstance(item, dict):
+                continue
+            item_skill = str(item.get("skill") or "")
+            if skill_name and item_skill != skill_name:
+                continue
+            summary = item.get("summary") if isinstance(item.get("summary"), dict) else {}
+            entries.append(
+                {
+                    "time": str(item.get("updated_at") or ""),
+                    "event": "promote",
+                    "skill": item_skill,
+                    "summary": f"promoted to champion (avg_score={summary.get('average_score', '?')}, hard_failures={summary.get('hard_failures', '?')})",
+                }
+            )
+
+    history_root = root / HISTORY_DIR
+    if history_root.is_dir():
+        for path in history_root.glob("*.jsonl"):
+            for row in _read_jsonl_rows(path):
+                entry_skill = str(row.get("skill") or path.stem)
+                if skill_name and entry_skill != skill_name:
+                    continue
+                entries.append(
+                    {
+                        "time": str(row.get("time") or ""),
+                        "event": "snapshot",
+                        "skill": entry_skill,
+                        "summary": f"version snapshot v{row.get('version', '')} (lesson: {_preview(row.get('lesson', ''), 80)})",
+                    }
+                )
+
+    entries.sort(key=lambda e: str(e.get("time") or ""))
+    return entries
 
 
 def record_online_skill_provenance(
@@ -126,6 +321,7 @@ def record_online_skill_provenance(
     retrieved_reference: dict[str, Any] | None = None,
     decision: dict[str, Any] | None = None,
     error: str = "",
+    trace_id: str = "",
 ) -> None:
     row = {
         "event": "online_ingest",
@@ -138,6 +334,7 @@ def record_online_skill_provenance(
         "retrieved_reference": retrieved_reference or {},
         "decision": decision or {},
         "error": _preview(error, 1200),
+        "trace_id": str(trace_id or ""),
     }
     _append_jsonl(get_evolution_dir() / ONLINE_PROVENANCE_LOG, row)
     _update_online_provenance_index(row)
@@ -295,6 +492,7 @@ def create_skill_file(
     evidence: str = "",
     actor: str = "agent",
     tags: list[str] | None = None,
+    trace_id: str = "",
 ) -> dict[str, Any]:
     resolved_name = str(name or "").strip()
     if not resolved_name:
@@ -342,8 +540,29 @@ def create_skill_file(
         "description": _preview(description, 1200),
         "when_to_use": _preview(when_to_use, 1200),
         "evidence": _preview(evidence, 1200),
+        "trace_id": str(trace_id or ""),
     }
     _append_jsonl(get_evolution_dir() / USAGE_LOG, event)
+    # SkillsBench 配对评测基线：创建时在 provenance index 初始化 no-skill 基线占位，评测时填充。
+    try:
+        index_path = get_evolution_dir() / ONLINE_PROVENANCE_INDEX
+        index = _read_json(index_path, {})
+        if isinstance(index, dict):
+            item = index.get(resolved_name)
+            if not isinstance(item, dict):
+                item = {
+                    "skill": resolved_name,
+                    "source_count": 0,
+                    "history_count": 0,
+                    "sources": [],
+                    "version_timeline": [],
+                    "usage": {},
+                }
+                index[resolved_name] = item
+            item.setdefault("no_skill_baseline", None)
+            _write_json(index_path, index)
+    except Exception:
+        pass
     return {"ok": True, **event}
 
 
@@ -378,6 +597,7 @@ def evolve_skill_file(
     description: str = "",
     when_to_use: str = "",
     tags: list[str] | None = None,
+    trace_id: str = "",
 ) -> dict[str, Any]:
     skill_file = resolve_skill_file(skill_name, target=target, active_dir=active_dir)
     if not skill_file:
@@ -421,6 +641,16 @@ def evolve_skill_file(
             meta["tags"] = ",".join(merged_tags[:12])
 
     if instructions.strip():
+        if len(str(instructions).strip()) > SKILL_MAX_INSTRUCTIONS_CHARS:
+            # SkillsBench 聚焦原则：超过阈值的完整指令不允许替换写入，交由调用方拆分新 skill。
+            return {
+                "ok": False,
+                "skill": resolved_name,
+                "error": "skill_too_large",
+                "suggest_split": True,
+                "max_chars": SKILL_MAX_INSTRUCTIONS_CHARS,
+                "current_chars": len(str(instructions).strip()),
+            }
         new_body = _skill_body(instructions.strip())
         note = _append_evolution_note("", lesson, rationale).strip()
         if note:
@@ -440,6 +670,7 @@ def evolve_skill_file(
         "lesson": _preview(lesson, 1200),
         "rationale": _preview(rationale, 1200),
         "history": str(history_path),
+        "trace_id": str(trace_id or ""),
     }
     _append_jsonl(get_evolution_dir() / USAGE_LOG, event)
     return {"ok": True, **event}

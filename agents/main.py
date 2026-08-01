@@ -23,10 +23,13 @@ from .ui import (
     print_interrupted,
     print_memory_entries,
     print_skill_entries,
+    print_skill_journey,
     print_warning,
 )
 from .session import load_session, get_latest_session_id
 from .memory import list_memories
+from .online_skill_eval import format_online_skill_eval_async
+from .skill_evolution import load_skill_journey
 from .skills import (
     create_skill,
     discover_skills,
@@ -231,6 +234,18 @@ async def run_repl(agent: Agent) -> None:
         if inp == "/skill-stats":
             print_info(skill_stats())
             continue
+        if inp == "/skill-eval":
+            # 分层评测：programmatic 全量（零 token），LLM judge 用独立 flash 模型（pro 写 + flash 评）。
+            judge_model = os.environ.get("OTTER_EVAL_JUDGE_MODEL") or "deepseek-v4-flash"
+            side_query = agent._build_side_query(max_tokens=500, model=judge_model)
+            print_info(await format_online_skill_eval_async(side_query=side_query))
+            continue
+        if inp == "/journey" or inp.startswith("/journey "):
+            # 技能演化时间线：无参数显示全部，带参数过滤单个 skill（含 judge reason）。
+            parts = inp.split(" ", 1)
+            skill_filter = parts[1].strip() if len(parts) > 1 else ""
+            print_skill_journey(load_skill_journey(skill_filter or None))
+            continue
         if inp.startswith("/extract_now"):
             hint = inp[len("/extract_now") :].strip()
             result = await agent.extract_now(hint)
@@ -255,9 +270,16 @@ async def run_repl(agent: Agent) -> None:
             if len(parts) < 2:
                 print_error("Usage: /skill-evolve <skill-name> <durable lesson>")
                 continue
-            result = evolve_skill(parts[0], parts[1], rationale="Manual REPL evolution", target="active")
+            result = evolve_skill(
+                parts[0],
+                parts[1],
+                rationale="Manual REPL evolution",
+                target="active",
+                trace_id=agent._current_window_trace_id or "",
+            )
             if result.get("ok"):
                 print_info(f"Evolved skill {result.get('skill')} to version {result.get('version')}")
+                agent._maybe_schedule_skill_eval(parts[0])
             else:
                 print_error(str(result.get("error") or result))
             continue
@@ -276,9 +298,11 @@ async def run_repl(agent: Agent) -> None:
                 context="inline",
                 user_invocable=False,
                 evidence="Manual REPL skill creation",
+                trace_id=agent._current_window_trace_id or "",
             )
             if result.get("ok"):
                 print_info(f"Created skill {result.get('skill')} at {result.get('file')}")
+                agent._maybe_schedule_skill_eval(result.get("skill"))
             else:
                 print_error(str(result.get("error") or result))
             continue
@@ -351,6 +375,8 @@ REPL commands:
   /memory             List saved memories
   /skills             List available skills
   /skill-stats        Show skill usage and evolution stats
+  /skill-eval         Evaluate skill evolution quality (layered eval, flash judge)
+  /journey [name]     Show skill evolution timeline (create/invoke/evolve/promote)
   /extract_now        Extract the current pending online skill window: /extract_now [hint]
   /skill-feedback     Record feedback: /skill-feedback <skill> <rating> [note]
   /skill-evolve       Evolve a skill: /skill-evolve <skill> <durable lesson>

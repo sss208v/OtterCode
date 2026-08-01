@@ -197,6 +197,7 @@ class Agent:
         self._last_retrieved_skill_reference: dict[str, Any] | None = None
         self._last_retrieved_skill_hits: list[dict[str, Any]] = []
         self._pending_skill_extraction_window: dict[str, Any] | None = None
+        self._current_window_trace_id: str | None = None
         self._background_skill_tasks: set[asyncio.Task] = set()
 
         #构建系统提示词
@@ -277,10 +278,11 @@ class Agent:
         return self._current_task is not None and not self._current_task.done()
 
     #大模型调用的工厂方法,构建一个用于记忆召回（memory recall）的 sideQuery 可调用对象，兼容anthropic, openai。
-    def _build_side_query(self, *, max_tokens: int = 256):
+    # model 参数用于评测等场景覆盖主模型（如 flash 评），缺省时回落主模型（pro 写）。
+    def _build_side_query(self, *, max_tokens: int = 256, model: str | None = None):
         if self._anthropic_client:
             client = self._anthropic_client
-            model = self.model
+            model = model or self.model
             async def _sq(system:str, user_message:str)->str:
 
                 resp = await client.messages.create(
@@ -291,7 +293,7 @@ class Agent:
             return _sq
         if self._openai_client:
             client = self._openai_client
-            model = self.model
+            model = model or self.model
             async def _sq_openai(system:str, user_message:str)->str:
                 resp = await client.chat.completions.create(
                     model=model,
@@ -557,8 +559,31 @@ class Agent:
     ) -> None:
         if not original_user_message.strip() or not assistant_text.strip():
             return
+        messages = self._recent_dialog_messages(max_messages=8)
+        # 窗口级 trace_id：基于内容哈希（skill + latest_user + messages），同一窗口回写共用同一条 trace。
+        try:
+            from .skill_evolution import _stable_hash, record_skill_trace
+
+            top_hit = max(self._last_retrieved_skill_hits or [], key=lambda h: float(h.get("score", 0.0) or 0.0))
+            top_skill = str(top_hit.get("name") or "") or (retrieved_reference or {}).get("name") or ""
+            trace_id = _stable_hash(
+                {"skill": top_skill, "messages": messages, "latest_user": original_user_message}
+            )
+            self._current_window_trace_id = trace_id
+            record_skill_trace(
+                skill_name=top_skill,
+                trace_id=trace_id,
+                trigger_query=original_user_message,
+                hit_scores=list(self._last_retrieved_skill_hits or []),
+                messages=messages,
+                latest_user=original_user_message,
+                latest_assistant=assistant_text,
+                session_id=self.session_id,
+            )
+        except Exception:
+            pass
         self._pending_skill_extraction_window = {
-            "messages": self._recent_dialog_messages(max_messages=8),
+            "messages": messages,
             "latest_user": original_user_message,
             "latest_assistant": assistant_text,
             "retrieved_reference": self._compact_retrieved_reference(retrieved_reference),
@@ -593,13 +618,48 @@ class Agent:
             hint=str(window.get("hint") or ""),
             confirm_write=self._confirm_online_skill_write if interactive_confirm else self._confirm_background_online_skill_write,
             target=os.environ.get("OTTER_AUTO_SKILL_TARGET", "project"),
+            trace_id=self._current_window_trace_id or "",
         )
+        # 演化结果回写同一窗口的 trace，串起“触发->执行->结果->演化”链条。
+        if self._current_window_trace_id:
+            try:
+                from .skill_evolution import record_skill_trace
+
+                record_skill_trace(
+                    skill_name=str(result.get("skill") or ""),
+                    trace_id=self._current_window_trace_id,
+                    evolution_action=str(result.get("action") or "none"),
+                    evolution_time=str(result.get("time") or ""),
+                )
+            except Exception:
+                pass
         if result.get("ok"):
             if result.get("action") in {"add", "merge"}:
                 self._refresh_runtime_system_prompt()
                 print_info(f"Online skill {result.get('action')}: {result.get('skill')}")
+                self._maybe_schedule_skill_eval(str(result.get("skill") or ""))
         elif result.get("action") not in {"add_denied", "merge_denied"}:
             print_error(f"Online skill evolution failed: {result.get('error') or result}")
+
+    def _maybe_schedule_skill_eval(self, skill_name: str) -> None:
+        # 事件驱动增量评测（VeRO 预算控制）：evolve/add 成功后，若 OTTER_EVAL_AUTO=1 则后台评测。
+        # judge 用独立 flash 模型（OTTER_EVAL_JUDGE_MODEL），演化抽取仍走主模型（pro 写 + flash 评）。
+        raw = os.environ.get("OTTER_EVAL_AUTO", "0").strip().lower()
+        if raw not in {"1", "true", "yes", "on"} or not skill_name:
+            return
+        try:
+            from .online_skill_eval import evaluate_online_skill_evolution_async
+
+            judge_model = os.environ.get("OTTER_EVAL_JUDGE_MODEL") or "deepseek-v4-flash"
+            side_query = self._build_side_query(max_tokens=500, model=judge_model)
+
+            async def _eval_task() -> None:
+                # 单 lineage 增量评测：只评测被改动的 skill，控制 token 成本。
+                await evaluate_online_skill_evolution_async(side_query=side_query, skill_name=skill_name)
+
+            self._schedule_background_skill_task(_eval_task())
+        except Exception:
+            pass
 
     async def _run_skill_usage_tracking(self, original_user_message: str, assistant_text: str) -> None:
         if not self._online_evolution_enabled() or self.permission_mode == "plan":
@@ -619,6 +679,18 @@ class Agent:
                 side_query=side_query,
             )
             result = record_usage_judgments(judgments)
+            # usage 判断结果回写同一窗口 trace：记录每个命中 skill 的 retrieved/relevant/used。
+            if self._current_window_trace_id:
+                try:
+                    from .skill_evolution import record_skill_trace
+
+                    record_skill_trace(
+                        skill_name=str((judgments[0] or {}).get("name") or "") if judgments else "",
+                        trace_id=self._current_window_trace_id,
+                        usage_judgment={"judgments": judgments[:10], "pruned": list(result.get("pruned") or [])},
+                    )
+                except Exception:
+                    pass
             if result.get("pruned"):
                 self._refresh_runtime_system_prompt()
         except Exception:
@@ -639,6 +711,7 @@ class Agent:
         self._anthropic_messages = []
         self._openai_messages = []
         self._pending_skill_extraction_window = None
+        self._current_window_trace_id = None
         self._last_retrieved_skill_reference = None
         self._last_retrieved_skill_hits = []
         if self.use_openai:

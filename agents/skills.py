@@ -114,6 +114,7 @@ def _load_skills_from_dir( base_dir: Path, source: str, skills:dict[str, SkillDe
 def _parse_skill_file(file_path: Path, source: str, skill_dir: str) -> SkillDefinition:
     try:
         # SKILL.md = frontmatter 配置 + markdown 正文。
+        # Windows 默认 GBK，必须显式 UTF-8，否则含中文的技能文件解码崩溃被静默丢弃。
         raw = file_path.read_text(encoding="utf-8", errors="replace")
         result = parse_frontmatter(raw)
         meta = result.meta
@@ -350,6 +351,7 @@ def evolve_skill(
     description: str = "",
     when_to_use: str = "",
     tags: list[str] | None = None,
+    trace_id: str = "",
 ) -> dict:
     skill = get_skill_by_name(skill_name)
     result = evolve_skill_file(
@@ -362,6 +364,7 @@ def evolve_skill(
         description=description,
         when_to_use=when_to_use,
         tags=tags,
+        trace_id=trace_id,
     )
     if result.get("ok"):
         reset_skill_cache()
@@ -380,6 +383,7 @@ def create_skill(
     evidence: str = "",
     actor: str = "agent",
     tags: list[str] | None = None,
+    trace_id: str = "",
 ) -> dict:
     result = create_skill_file(
         name=name,
@@ -393,6 +397,7 @@ def create_skill(
         evidence=evidence,
         actor=actor,
         tags=tags,
+        trace_id=trace_id,
     )
     if result.get("ok"):
         reset_skill_cache()
