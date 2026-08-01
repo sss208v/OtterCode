@@ -1,7 +1,7 @@
 # tests/test_agent_context_and_dispatch.py
 # 针对 agents/agent.py 中风险最高的两块纯逻辑路径的最小聚焦测试：
-#   1. 上下文压缩触发条件：_check_and_compact / _budget_tool_results_* /
-#      _snip_stale_results_* / _microcompact_*
+#   1. 上下文压缩触发条件：_check_and_compact / _compact_anthropic|_openai /
+#      _budget_tool_results_* / _snip_stale_results_* / _microcompact_*
 #   2. tool-call 解析与调度：_normalize_anthropic_messages / _find_tool_use_by_id /
 #      _execute_tool_call 的路由分支
 # 仅使用标准库 unittest，运行方式：python -m unittest discover -s tests
@@ -203,6 +203,67 @@ class TestMicrocompact(unittest.TestCase):
         self.assertEqual(contents[:2], ["[Old result cleared]", "[Old result cleared]"])
         self.assertEqual(contents[2:], ["result-2", "result-3", "result-4"])
         self.assertEqual(len(contents) - 2, KEEP_RECENT_RESULTS)
+
+
+class TestCompactConversation(unittest.TestCase):
+    """摘要压缩：消息过短不触发；压缩后历史折叠为 [摘要+确认+末条用户消息]，
+    且 last_input_token_count 必须归零（为下一轮压缩触发判断提供干净基准）。"""
+
+    @staticmethod
+    def _summary_content_mock():
+        return MagicMock(content=[MagicMock(type="text", text="SUMMARY")])
+
+    def test_anthropic_noop_below_four_messages(self):
+        a = _make_agent()
+        a._anthropic_messages = [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+        ]
+        a._anthropic_client = MagicMock()
+        a._anthropic_client.messages.create = AsyncMock()
+        asyncio.run(a._compact_anthropic())
+        a._anthropic_client.messages.create.assert_not_awaited()
+        self.assertEqual(len(a._anthropic_messages), 2)
+
+    def test_anthropic_compacts_and_resets_token_counter(self):
+        a = _make_agent()
+        a.last_input_token_count = 12345
+        a._anthropic_messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "world"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "what now?"},
+        ]
+        a._anthropic_client = MagicMock()
+        a._anthropic_client.messages.create = AsyncMock(return_value=self._summary_content_mock())
+        asyncio.run(a._compact_anthropic())
+        # 历史折叠为 [摘要 + 确认 + 最后一条用户消息]
+        self.assertEqual(a._anthropic_messages[0]["content"], "[Previous conversation summary]\nSUMMARY")
+        self.assertEqual(a._anthropic_messages[1]["role"], "assistant")
+        self.assertEqual(a._anthropic_messages[-1]["content"], "what now?")
+        self.assertEqual(len(a._anthropic_messages), 3)
+        # 计数器归零：回归 last_input_tokens 拼写笔误
+        self.assertEqual(a.last_input_token_count, 0)
+
+    def test_openai_compacts_and_resets_token_counter(self):
+        a = _make_agent(use_openai=True)
+        a.last_input_token_count = 9999
+        a._openai_messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "what now?"},
+        ]
+        a._openai_client = MagicMock()
+        a._openai_client.completions.create = AsyncMock(return_value=MagicMock(
+            choices=[MagicMock(type="text", text="SUMMARY")]
+        ))
+        asyncio.run(a._compact_openai())
+        self.assertEqual(a._openai_messages[0]["content"], "sys")
+        self.assertEqual(a._openai_messages[1]["content"], "[Previous conversation summary]\nSUMMARY")
+        self.assertEqual(a._openai_messages[-1]["content"], "what now?")
+        self.assertEqual(a.last_input_token_count, 0)
 
 
 class TestNormalizeAnthropicMessages(unittest.TestCase):

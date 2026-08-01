@@ -15,7 +15,7 @@ Otter Code 是一个基于 Python 实现的**自进化 Harness Agent**。它不�
 - **长期 Memory**：按项目路径 hash 隔离记忆，保存用户偏好、项目背景、历史决策和参考资料。
 - **MCP 外部工具扩展**：自研 stdio JSON-RPC MCP Client，把外部 MCP Server 工具包装为 `mcp__server__tool`。
 - **子 Agent**：支持 explore、plan、general 以及自定义子 Agent，用隔离上下文完成探索、规划或局部任务。
-- **会话恢复和上下文压缩**：自动保存 session，支持 `--resume`、`/compact`，并对大工具结果做截断或持久化。
+- **会话恢复和上下文压缩**：每轮自动保存 session，支持 `--resume`、`/compact`；三级压缩管线按窗口利用率梯度截断/修剪/清理旧工具结果，利用率过高时用模型摘要折叠历史，超大工具结果落盘只留路径与预览。
 
 ## 项目架构
 
@@ -68,6 +68,7 @@ OtterCode/
 │   ├── skills/                    # 项目级 Skills
 │   └── skill-evolution/           # Skills 自进化审计产物
 ├── .mcp.json                      # MCP Server 配置
+├── tests/                          # 单元测试（unittest，见“运行测试”）
 ├── Dockerfile
 ├── requirements.txt
 └── README.md
@@ -155,6 +156,15 @@ REPL 中也可以输入 `/plan` 切换。
 
 ```bash
 python -m agents.main --resume
+```
+
+### 运行测试
+
+单元测试覆盖权限系统、上下文压缩与工具分发等关键路径，均只依赖标准库：
+
+```bash
+python -m compileall agents
+python -m unittest discover -s tests
 ```
 
 ## 如何让项目自动沉淀并进化 Skills
@@ -277,7 +287,7 @@ Skill 是一个可复用能力说明文件，即带 frontmatter 的 SKILL.md。�
 
 ```markdown
 ---
-name: code_review
+name: code-review
 description: Review code changes with a bug-risk-first mindset.
 when-to-use: When the user asks for code review.
 user-invocable: true

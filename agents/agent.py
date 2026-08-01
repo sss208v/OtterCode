@@ -789,7 +789,7 @@ class Agent:
         ]
         if last_user_msg.get("role") == "user":
             self._anthropic_messages.append(last_user_msg)
-        self.last_input_tokens=0
+        self.last_input_token_count=0
 
     async def _compact_openai(self)->None:
         if len (self._openai_messages)<4:
