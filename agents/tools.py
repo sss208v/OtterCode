@@ -26,22 +26,6 @@ EDIT_TOOLS = {"write_file", "edit_file", "skill_evolve", "skill_create"}
 CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search", "file_stats"}
 
 
-
-
-
-
-
-def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[ToolDef]:
-    """过滤并返回当前可用的工具定义列表，主要用于 API 调用前剔除尚未激活的“延迟工具”（deferred tools），并删除无关的元数据字段。"""
-    tools = all_tools if all_tools is not None else tool_definitions
-    return [
-        {k: v for k, v in t.items() if k != "deferred"}
-        for t in tools
-        if not t.get("deferred") or t["name"] in _activated_tools
-    ]
-
-
-
 #工具定义
 tool_definitions: list[ToolDef] = [
     {
@@ -435,6 +419,7 @@ def _list_files(inp: dict) -> str:
 def _file_stats(inp: dict) -> str:
     try:
         p = _resolve_tool_path(inp["file_path"])
+        # Windows 默认 GBK，必须显式 UTF-8，否则中文文件解码崩溃。
         content = p.read_text(encoding="utf-8", errors="replace")
         lines = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
         return (
@@ -463,6 +448,7 @@ def _grep_search(inp: dict) -> str:
                 args.append(f"--include={include}")
             args.extend(["--", pattern, path])
 
+            # Windows 默认 GBK，必须显式 UTF-8，否则中文输出解码崩溃。
             result = subprocess.run(
                 args, capture_output=True, text=True, timeout=10, encoding="utf-8", errors="replace"
             )
@@ -552,6 +538,7 @@ def reset_activated_tools() -> None:
     _activated_tools.clear()
 
 def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[ToolDef]:
+    """过滤并返回当前可用的工具定义列表，主要用于 API 调用前剔除尚未激活的“延迟工具”（deferred tools），并删除无关的元数据字段。"""
     tools = all_tools if all_tools is not None else tool_definitions
     return [
         {k: v for k, v in t.items() if k != "deferred"}
@@ -574,7 +561,7 @@ def _run_shell(inp: dict) -> str:
             capture_output=True,
             text=True,
             timeout=timeout_s,
-            encoding="utf-8",
+            encoding="utf-8",  # Windows 默认 GBK，必须显式 UTF-8，否则中文输出解码崩溃。
             errors="replace"
         )
         output = result.stdout or ""

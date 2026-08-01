@@ -22,6 +22,8 @@
 - `.otter/skills/<skill_name>/SKILL.md`：项目级 Skills，由 Otter Code Runtime 加载和自进化写入
 - `.otter/skill-evolution/`：Skills 自进化的审计产物（usage.jsonl、provenance、版本快照等）
 
+编码约束：SKILL.md 一律 UTF-8 编码。Windows 下默认 GBK 解码会静默丢弃含中文的技能文件（见 `skills.py` `_parse_skill_file` 的 `read_text(encoding="utf-8")`）。
+
 进驻 agent 不要把 `.otter/skills` 下的 SKILL.md 当作本仓库的工程规范来遵守，也不要在评审中把它们当作代码质量门禁；它们是产品功能的数据。修改 `.otter/` 内容属于产品行为验证范畴，不属于常规代码变更。
 
 ## 危险区：agents/tools.py 的权限模式语义
