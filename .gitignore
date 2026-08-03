@@ -232,11 +232,6 @@ analysis_progress.md
 .qoder/
 .DS_Store
 
-# Local plan drafts
-plan-*.md
-
-# Personal learning materials (local only)
-OtterCode*.html
-OtterCode*.md
-!README.md
-错题册.html
+# Local-only materials (learning handbook, mistake book, local reports, plan drafts)
+# Not uploaded to GitHub; kept for local/agent reading only.
+local/

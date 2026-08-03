@@ -216,6 +216,24 @@ def print_warning(msg: str) -> None:
     ))
 
 
+def print_verification(report: dict) -> None:
+    """三层验证结果展示：PASS 绿色面板 / FAIL 红色面板，逐条列出规则状态。"""
+    passed = bool(report.get("passed"))
+    color = "green" if passed else "red"
+    lines = []
+    for r in report.get("results", []):
+        icon = "✔" if r.get("status") == "pass" else ("-" if r.get("status") == "skip" else "✘")
+        lines.append(f"{icon} [L{r.get('level', '?')}] {r.get('id', '?')} ({r.get('type', '?')}): {r.get('detail', '')}")
+    title = f"[bold]{'PASS' if passed else 'FAIL'}[/bold] Verification ({report.get('total', 0)} rules)"
+    console.print(Panel(
+        _safe_text("\n".join(lines)) if lines else _safe_text("(no rules)"),
+        title=title,
+        border_style=color,
+        box=box.ROUNDED,
+        padding=(0, 1),
+    ))
+
+
 def print_goodbye() -> None:
     console.print(Panel(
         Text("Bye. Otter cookie saved for next time.", style="bold #f6c177"),

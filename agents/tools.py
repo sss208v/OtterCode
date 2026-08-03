@@ -196,6 +196,16 @@ tool_definitions: list[ToolDef] = [
     },
     # ─── Tool search (deferred tool loader) ─────────────────────
     {
+        "name": "run_verification",
+        "description": "Run the configured three-layer verification (L1 artifact existence -> L2 artifact correctness -> L3 business state) and return a structured report. Rules come from .otter/verification.json plus auto-collected files written this session. Commands executed by verification rules are restricted to those declared in the config. Use this when the task claims completion and you want to prove the deliverable actually exists, is correct, and the business state is reached.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rule_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional: only run rules with these ids"},
+            },
+        },
+    },
+    {
         "name": "tool_search",
         "description": "Search for available tools by name or keyword. Returns full schema definitions for matching deferred tools so you can use them.",
         "input_schema": {
@@ -703,6 +713,8 @@ def check_permission(
             return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
         if tool_name == "run_shell":
             return {"action": "deny", "message": "Shell commands blocked in plan mode"}
+        if tool_name == "run_verification":
+            return {"action": "deny", "message": "Verification blocked in plan mode (plan phase is read-only, no deliverable yet)"}
 
     if tool_name in ("enter_plan_mode", "exit_plan_mode"):
         return {"action": "allow"}

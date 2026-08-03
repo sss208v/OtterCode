@@ -20,9 +20,12 @@ from agents.session import save_session
 from agents.subagent import get_sub_agent_config
 from agents.tools import ToolDef, tool_definitions, execute_tool, CONCURRENCY_SAFE_TOOLS, check_permission, \
     get_active_tool_definitions
+from agents.verification import (MAX_VERIFICATION_ATTEMPTS, collect_written_file_rules,
+                                format_verification_feedback, load_verification_rules,
+                                run_verification)
 from agents.ui import print_info, print_divider, print_assistant_text, print_sub_agent_start, print_sub_agent_end, \
     start_spinner, stop_spinner, print_cost, print_tool_call, print_tool_result, print_confirmation, print_retry, \
-    print_error
+    print_error, print_verification
 
 
 # 指数退避重试
@@ -163,6 +166,10 @@ class Agent:
         self._current_task:asyncio.Task | None = None
         #权限白名单
         self._confirmed_paths: set[str] = set()
+
+        # 三层验证：本轮写过的产物文件 + 验证历史（用于自动验证与会话存档）
+        self._written_files: set[str] = set()
+        self._verification_log: list[dict] = []
 
 
         # 计划模式”（Plan Mode）状态的变量
@@ -822,6 +829,7 @@ class Agent:
                 },
                 "anthropicMessages": _sanitize_for_utf8(self._anthropic_messages) if not self.use_openai else None,
                 "openaiMessages": _sanitize_for_utf8(self._openai_messages) if self.use_openai else None,
+                "verification": self._verification_log or None,
             })
         except Exception:
             pass
@@ -869,7 +877,7 @@ class Agent:
             return
         system_msg = self._openai_messages[0]
         last_user_msg = self._openai_messages[-1]
-        summary_resp = await self._openai_client.completions.create(
+        summary_resp = await self._openai_client.chat.completions.create(
             model=self.model,
             messages =[
                 {"role": "system", "content": "You are a conversation summarizer. Be concise but preserve important details."},
@@ -878,7 +886,7 @@ class Agent:
 
             ],
         )
-        summary_text = summary_resp.choices[0].text if summary_resp.choices and summary_resp.choices[0].type == "text" else ""
+        summary_text = summary_resp.choices[0].message.content or "" if summary_resp.choices else ""
         self._openai_messages=[
             system_msg,
             {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
@@ -1065,9 +1073,69 @@ class Agent:
 
     #执行工具入口
 
+    # ─── 三层验证（L1 存在性 / L2 正确性 / L3 业务状态）─────────
+    def _load_active_verification_rules(self) -> list:
+        """组合验证规则：配置文件声明规则 + 本轮写过的产物自动 L1 规则。"""
+        rules = load_verification_rules()
+        rules += collect_written_file_rules(self._written_files, root=Path.cwd())
+        return rules
+
+    def _inject_user_feedback(self, text: str) -> None:
+        """把验证失败反馈作为 user 消息注入对话，驱动模型继续修复。"""
+        text = _safe_utf8_text(text)
+        if self.use_openai:
+            self._openai_messages.append({"role": "user", "content": text})
+        else:
+            self._anthropic_messages.append({"role": "user", "content": text})
+
+    async def _verify_before_done(self) -> bool:
+        """模型声称完成（不再调用工具）时的验证检查点。
+
+        返回 True 表示可以结束本轮：无规则 / 全部通过 / 重试耗尽放行；
+        返回 False 表示验证失败，已注入修复反馈，循环应继续。
+        """
+        if self.is_sub_agent or self.permission_mode == "plan":
+            return True
+        rules = self._load_active_verification_rules()
+        if not rules:
+            return True
+        report = run_verification(rules, cwd=Path.cwd())
+        print_verification(report)
+        self._verification_log.append({
+            "attempt": len(self._verification_log) + 1,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "passed": report["passed"],
+            "total": report["total"],
+            "failures": report["failures"],
+        })
+        if report["passed"]:
+            return True
+        attempt = len(self._verification_log)
+        if attempt >= MAX_VERIFICATION_ATTEMPTS:
+            print_error(f"Verification failed after {attempt} attempts; releasing turn (marked unverified).")
+            return True
+        print_info(f"Verification failed (attempt {attempt}/{MAX_VERIFICATION_ATTEMPTS}); feeding feedback back to model.")
+        self._inject_user_feedback(format_verification_feedback(report, attempt, MAX_VERIFICATION_ATTEMPTS))
+        return False
+
+    async def _run_verification_tool(self, inp: dict) -> str:
+        """显式验证工具：按配置规则（可过滤 rule_ids）运行验证并返回结构化报告。"""
+        rules = self._load_active_verification_rules()
+        rule_ids = inp.get("rule_ids")
+        if rule_ids:
+            ids = set(rule_ids)
+            rules = [r for r in rules if r.id in ids]
+        if not rules:
+            return "No verification rules configured or matching the requested rule_ids."
+        report = run_verification(rules, cwd=Path.cwd())
+        print_verification(report)
+        return json.dumps(report, ensure_ascii=False, indent=2)
+
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
         if name in ("enter_plan_mode", "exit_plan_mode"):
             return await self._execute_plan_mode_tool(name)
+        if name == "run_verification":
+            return await self._run_verification_tool(inp)
         if name == "agent":
             return await self._execute_agent_tool(inp)
         if name == "skill":
@@ -1083,6 +1151,11 @@ class Agent:
                     self._refresh_runtime_system_prompt()
             except Exception:
                 pass
+        if name in {"write_file", "edit_file"}:
+            # 记录本轮声明写入的产物路径，供自动 L1 存在性验证使用。
+            path = inp.get("file_path")
+            if path:
+                self._written_files.add(path)
         return result
 
 
@@ -1164,8 +1237,8 @@ class Agent:
                 else:  # manual-execute
                     target_mode = self._pre_plan_mode or "default"
 
-                #离开计划模式
-                self._pre_plan_mode = target_mode
+                #离开计划模式：切换到目标权限，并清空进入前保存的模式
+                self.permission_mode = target_mode
                 self._pre_plan_mode = None
                 saved_plan_path = self._plan_file_path
                 self._plan_file_path = None
@@ -1329,11 +1402,14 @@ class Agent:
                 "content": [self._block_to_dict(b) for b in response.content],
             })
 
-            # 没有工具调用，说明模型已经给出最终回复，本轮对话结束。
+            # 没有工具调用，说明模型认为已经完成。进入三层验证检查点：
+            # 全部通过才结束；失败则注入反馈让模型修复（fix loop，限次）。
             if not tool_uses:
                 if not self.is_sub_agent:
                     print_cost(self.total_input_tokens, self.total_output_tokens)
-                break
+                if await self._verify_before_done():
+                    break
+                continue
 
             # 有工具调用时，进入下一轮工具执行。这里同时检查 turn/budget 限制。
             self.current_turns += 1
@@ -1590,7 +1666,9 @@ class Agent:
             if not tool_calls:
                 if not self.is_sub_agent:
                     print_cost(self.total_input_tokens, self.total_output_tokens)
-                break
+                if await self._verify_before_done():
+                    break
+                continue
 
             self.current_turns += 1
             budget = self._check_budget()

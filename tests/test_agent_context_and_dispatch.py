@@ -256,14 +256,39 @@ class TestCompactConversation(unittest.TestCase):
             {"role": "user", "content": "what now?"},
         ]
         a._openai_client = MagicMock()
-        a._openai_client.completions.create = AsyncMock(return_value=MagicMock(
-            choices=[MagicMock(type="text", text="SUMMARY")]
+        # 必须走 chat.completions.create（Chat Completions）；legacy completions.create 不接受 messages 参数
+        a._openai_client.chat.completions.create = AsyncMock(return_value=MagicMock(
+            choices=[MagicMock(message=MagicMock(content="SUMMARY"))]
         ))
+        a._openai_client.completions.create = AsyncMock()
         asyncio.run(a._compact_openai())
+        a._openai_client.chat.completions.create.assert_awaited_once()
+        a._openai_client.completions.create.assert_not_awaited()
         self.assertEqual(a._openai_messages[0]["content"], "sys")
         self.assertEqual(a._openai_messages[1]["content"], "[Previous conversation summary]\nSUMMARY")
         self.assertEqual(a._openai_messages[-1]["content"], "what now?")
         self.assertEqual(a.last_input_token_count, 0)
+
+    def test_openai_summary_without_content_falls_back_to_empty(self):
+        # 响应缺失 message.content（如 choices 为空或 content 为 None）时不得崩溃
+        a = _make_agent(use_openai=True)
+        a._openai_messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"},
+        ]
+        a._openai_client = MagicMock()
+        for label, resp in (
+            ("empty-choices", MagicMock(choices=[])),
+            ("none-content", MagicMock(choices=[MagicMock(message=MagicMock(content=None))])),
+        ):
+            with self.subTest(label=label):
+                a._openai_client.chat.completions.create = AsyncMock(return_value=resp)
+                asyncio.run(a._compact_openai())
+                self.assertEqual(
+                    a._openai_messages[1]["content"], "[Previous conversation summary]\n"
+                )
 
 
 class TestNormalizeAnthropicMessages(unittest.TestCase):
