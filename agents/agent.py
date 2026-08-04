@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
+import random
 import re
 import time
 import uuid
@@ -14,14 +16,21 @@ import anthropic
 import openai
 
 from agents.mcp_client import McpManager
-from agents.memory import MemoryPrefetch, start_memory_prefetch, format_memories_for_injection
+try:
+    from agents.memory import (MemoryPrefetch, start_memory_prefetch,
+                               format_memories_for_injection, save_memory_structured)
+except ImportError:
+    # memory.py 的 save_memory_structured 由并行子代理补充实现；缺失时降级为 None，
+    # 相关抽取/回写路径内部自行判空跳过，避免模块级导入失败。
+    from agents.memory import MemoryPrefetch, start_memory_prefetch, format_memories_for_injection
+    save_memory_structured = None
 from agents.prompt import build_system_prompt
 from agents.session import save_session
 from agents.subagent import get_sub_agent_config
 from agents.tools import ToolDef, tool_definitions, execute_tool, CONCURRENCY_SAFE_TOOLS, check_permission, \
     get_active_tool_definitions
-from agents.verification import (MAX_VERIFICATION_ATTEMPTS, collect_written_file_rules,
-                                format_verification_feedback, load_verification_rules,
+from agents.verification import (collect_written_file_rules, format_verification_feedback,
+                                get_max_verification_attempts, load_verification_rules,
                                 run_verification)
 from agents.ui import print_info, print_divider, print_assistant_text, print_sub_agent_start, print_sub_agent_end, \
     start_spinner, stop_spinner, print_cost, print_tool_call, print_tool_result, print_confirmation, print_retry, \
@@ -33,7 +42,7 @@ from agents.ui import print_info, print_divider, print_assistant_text, print_sub
 
 def _is_retryable(error: Exception) -> bool:
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
-    if status in (429, 503, 529):
+    if status in (429, 500, 502, 503, 504, 529):
         return True
     msg = str(error)
     if "overloaded" in msg or "ECONNRESET" in msg or "ETIMEDOUT" in msg:
@@ -67,7 +76,7 @@ async def _with_retry(fn, max_retries: int = 3):
         except Exception as error:
             if attempt >= max_retries or not _is_retryable(error):
                 raise
-            delay = min(1000 * (2 ** attempt), 30000) / 1000 + (hash(str(time.time())) % 1000) / 1000
+            delay = min(1000 * (2 ** attempt), 30000) / 1000 + (random.random() * 1000) / 1000
             status = getattr(error, "status_code", None) or getattr(error, "status", None)
             reason = f"HTTP {status}" if status else (getattr(error, "code", None) or "network error")
             print_retry(attempt + 1, max_retries, reason)
@@ -110,7 +119,25 @@ def _get_max_output_tokens(model: str) -> int:
         return 32000
     return 16384
 
-#转换tool的形式到openai
+
+# CJK 常用区间：中日韩统一表意文字、扩展 A、兼容表意文字、假名、谚文
+_CJK_TOKEN_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]")
+
+
+def estimate_tokens(text: str) -> int:
+    """近似估算文本 token 数：CJK 每字约 1.5 token，其余按约 4 字符/token。
+
+    纯标准库实现的粗略度量，统一用于裁剪预算与发送前预估；空串返回 0，
+    非空文本至少返回 1。
+    """
+    if not text:
+        return 0
+    cjk_count = len(_CJK_TOKEN_RE.findall(text))
+    rest_len = max(0, len(text) - cjk_count)
+    est = int(cjk_count * 1.5) + int(rest_len / 4)
+    return max(1, est)
+
+
 def _to_openai_tools(tools: list[ToolDef]) -> list[dict]:
     return [
         {
@@ -123,6 +150,15 @@ def _to_openai_tools(tools: list[ToolDef]) -> list[dict]:
         }
         for t in tools
     ]
+
+
+def _filter_l1_rules(rules: list) -> list:
+    """过滤出 L1 存在性规则（file_exists/glob_exists/dir_nonempty 等 level == 1 的规则）。
+
+    子代理内部只跑 L1：L2/L3（file_contains / command_success 等）需要完整执行环境
+    （编译、测试、业务状态断言），子代理上下文不适合运行，避免误报与副作用。
+    """
+    return [r for r in rules if getattr(r, "level", None) == 1]
 
 
 class Agent:
@@ -139,6 +175,7 @@ class Agent:
                  confirm_fn:Callable[[str], Awaitable[bool]] | None=None,
                  custom_system_prompt: str | None=None,
                  custom_tools: list[ToolDef] | None=None,
+                 max_duration_s: float | None=None,
                  is_sub_agent: bool=False,):
         self.permission_mode = permission_mode
         self.thinking = thinking
@@ -149,8 +186,14 @@ class Agent:
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
+        # wall-clock 超时控制（--max-duration）：记录起点，_check_timeout 判断是否超时。
+        self.max_duration_s = max_duration_s
+        self._start_time = time.monotonic()
+        self._timed_out = False
+        # 大结果临时文件目录（~/.otter-code/tool-results）的一次性过期清理标记。
+        self._tool_results_cleaned = False
         self._custom_system_prompt = custom_system_prompt
-        self.effective_window=_get_context_windows(model) -20000
+        self.effective_window=_get_context_windows(model) - _get_max_output_tokens(model) - 4096
         self.session_id = uuid.uuid4().hex[:8]
         self.session_start_time= time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
 
@@ -170,6 +213,10 @@ class Agent:
         # 三层验证：本轮写过的产物文件 + 验证历史（用于自动验证与会话存档）
         self._written_files: set[str] = set()
         self._verification_log: list[dict] = []
+        # 最近一次验证结果（run_once 的 verified 字段来源；None 表示本轮从未触发验证）。
+        self._last_verification_passed: bool | None = None
+        # 中途 L1 检查点的工具调用计数（仅主代理生效）。
+        self._tool_call_count = 0
 
 
         # 计划模式”（Plan Mode）状态的变量
@@ -400,7 +447,18 @@ class Agent:
 
         finally:
             self._current_task = None
+        if self._timed_out:
+            note = "\n\n[max-duration reached] 已达最大运行时长限制，agent 已优雅中止。"
+            if self._output_buffer is not None:
+                self._output_buffer.append(note)
+            if self._turn_output_buffer is not None:
+                self._turn_output_buffer.append(note)
+            if self._output_buffer is None:
+                print_info(note.strip())
         assistant_text = "".join(self._turn_output_buffer or []).strip()
+        # sleep-time compute：主代理会话结束时从本轮对话抽取候选记忆并入库，失败静默。
+        if not self.is_sub_agent:
+            await self._extract_memories_from_session()
         self._turn_output_buffer = None
         if not self.is_sub_agent and not self._aborted:
             self._schedule_background_skill_task(self._run_skill_usage_tracking(original_user_message, assistant_text))
@@ -418,19 +476,23 @@ class Agent:
 
 
    #执行一次对话，收集本轮模型输出文本，并返回本轮消耗的 token 数
-    async def run_once(self, prompt:str)->None:
+    async def run_once(self, prompt:str)->dict:
         self._output_buffer = []
+        self._last_verification_passed = None
         prev_in = self.total_input_tokens
         prev_out = self.total_output_tokens
         await self.chat(prompt)
         text = "".join(self._output_buffer)
         self._output_buffer = None
+        # verified：最近一次验证是否通过；本轮从未触发验证（无规则/未到验证点）时默认 True。
+        verified = self._last_verification_passed if self._last_verification_passed is not None else True
         return {
             "text": text,
             "tokens":{
                 "input":self.total_input_tokens-prev_in,
                 "output":self.total_output_tokens-prev_out
             },
+            "verified": bool(verified),
         }
 
     #输出工具：统一处理模型输出文本。根据当前是否处于“收集输出”的模式
@@ -758,6 +820,14 @@ class Agent:
             self._anthropic_messages = self._normalize_anthropic_messages(_sanitize_for_utf8(data["anthropicMessages"]))
         if data.get("openaiMessages"):
             self._openai_messages = _sanitize_for_utf8(data["openaiMessages"])
+        # 恢复 read-before-edit 保护状态：edit_file 仍要求先 read_file。
+        raw_state = data.get("readFileState")
+        if isinstance(raw_state, dict):
+            cleaned: dict[str, float] = {}
+            for k, v in raw_state.items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    cleaned[str(k)] = float(v)
+            self._read_file_state = cleaned
         print_info(f"Session restored ({self._get_message_count()} messages).")
 
 
@@ -830,9 +900,94 @@ class Agent:
                 "anthropicMessages": _sanitize_for_utf8(self._anthropic_messages) if not self.use_openai else None,
                 "openaiMessages": _sanitize_for_utf8(self._openai_messages) if self.use_openai else None,
                 "verification": self._verification_log or None,
+                "readFileState": self._read_file_state or None,
             })
         except Exception:
             pass
+
+    def _persist_compact_summary(self, summary_text: str) -> None:
+        """将摘要压缩产生的会话摘要回写为 project 类型记忆。失败静默。
+
+        name 带时间戳（秒 + 纳秒），保证每次压缩产生独立记忆文件，
+        不再被 save_memory_structured 按固定 name 去重覆盖历史。
+        """
+        if not summary_text or self.is_sub_agent:
+            return
+        try:
+            if save_memory_structured is not None:
+                save_memory_structured(
+                    name=f"conversation-compact-summary-{time.strftime('%Y%m%d%H%M%S')}-{time.time_ns() % 1_000_000_000:09d}",
+                    description="Auto-saved conversation summary from context compaction",
+                    type="project",
+                    content=summary_text,
+                    session_id=self.session_id,
+                )
+        except Exception:
+            pass
+
+    def estimate_messages_tokens(self) -> int:
+        """估算当前消息列表的 token 总量（含 system prompt 与 tools schema 粗估）。"""
+        raw_messages = self._openai_messages if self.use_openai else self._anthropic_messages
+        total = estimate_tokens(self._system_prompt)
+        for msg in raw_messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                total += estimate_tokens(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if isinstance(block.get("text"), str):
+                        total += estimate_tokens(block["text"])
+                    elif isinstance(block.get("content"), str):
+                        total += estimate_tokens(block["content"])
+        # 工具定义的固定开销粗估（每轮 system/tools 前缀），失败跳过。
+        try:
+            total += estimate_tokens(json.dumps(self.tools))
+        except Exception:
+            pass
+        return total
+
+    async def _extract_memories_from_session(self) -> None:
+        """会话结束时用 side query 从本轮对话抽取候选记忆并入库。失败静默。"""
+        if self.is_sub_agent or not self._turn_output_buffer:
+            return
+        try:
+            side_query = self._build_side_query()
+            if side_query is None or save_memory_structured is None:
+                return
+            system_prompt = (
+                "You extract structured memories from a conversation turn. "
+                'Return ONLY a JSON object: {"memories": [{"name": str, "description": str, "type": str, "content": str}]}. '
+                "type must be one of: user, feedback, project, reference (use project if unsure). "
+                "Extract task points, user preferences, and project decisions. Skip empty content."
+            )
+            user_message = "Conversation turn:\n\n" + "\n".join(self._turn_output_buffer or [])
+            raw = await side_query(system_prompt, user_message)
+            match = re.search(r"\{.*\}", raw or "", flags=re.DOTALL)
+            if not match:
+                return
+            data = json.loads(match.group(0))
+            for mem in (data.get("memories") or []):
+                name = str(mem.get("name") or "").strip()
+                content = str(mem.get("content") or "").strip()
+                if not name or not content:
+                    continue
+                description = str(mem.get("description") or "").strip()
+                mtype = str(mem.get("type") or "project").strip()
+                if mtype not in ("user", "feedback", "project", "reference"):
+                    mtype = "project"
+                save_memory_structured(
+                    name=name,
+                    description=description,
+                    type=mtype,
+                    content=content,
+                    session_id=self.session_id,
+                )
+        except Exception as e:
+            print_error(f"[memory] session extraction failed: {e}")
 
     #自动压缩
     async def _check_and_compact(self)->None:
@@ -864,6 +1019,8 @@ class Agent:
             ],
         )
         summary_text = summary_resp.content[0].text if summary_resp.content and  summary_resp.content[0].type == "text" else "No summary available."
+        # 摘要回写 project 记忆（不修改消息结构，只在外部写文件）。
+        self._persist_compact_summary(summary_text)
         self._anthropic_messages=[
             {"role":"user","content":f"[Previous conversation summary]\n{summary_text}"},
             {"role": "assistant", "content": "Understood. I have the context from our previous conversation. How can I continue helping?"},
@@ -887,6 +1044,8 @@ class Agent:
             ],
         )
         summary_text = summary_resp.choices[0].message.content or "" if summary_resp.choices else ""
+        # 摘要回写 project 记忆（不修改消息结构，只在外部写文件）。
+        self._persist_compact_summary(summary_text)
         self._openai_messages=[
             system_msg,
             {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
@@ -914,9 +1073,9 @@ class Agent:
         #如果利用率低于 50%，说明空间还很充裕，直接返回，不做任何处理。
         if utilization < 0.5:
             return
-        #动态预算（Budget）：危急状态（>70%）：如果利用率很高，允许单个工具结果保留 15,000 个字符。
-        # 警戒状态（50%-70%）：如果利用率中等，只允许保留 30000 个字符。
-        budget = 15000 if utilization > 0.7 else 30000
+        #动态预算（Budget，单位 token）：危急状态（>70%）：如果利用率很高，允许单个工具结果保留 6000 token。
+        # 警戒状态（50%-70%）：如果利用率中等，只允许保留 12000 token（按 4 字符/token 反推约 48000 字符）。
+        budget = 6000 if utilization > 0.7 else 12000
 
         for msg in self._anthropic_messages:
 
@@ -925,9 +1084,10 @@ class Agent:
             if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
                 continue
             for block in msg["content"]:
-                if isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), str) and len(block["content"]) > budget:
-                    #计算保留长度 (keep)：keep = (budget - 80) // 2 这里预留了约 80 个字符的空间给中间的提示语，剩下的长度平分给开头和结尾。
-                    keep = (budget - 80) // 2
+                if isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), str) and estimate_tokens(block["content"]) > budget:
+                    #计算保留长度 (keep)：keep = (budget * 4 - 80) // 2 这里预留了约 80 个字符的空间给中间的提示语，
+                    # 按 4 字符/token 把 token 预算换算回字符数，剩下的长度平分给开头和结尾。
+                    keep = (budget * 4 - 80) // 2
                     #重组新内容 = 开头部分 + 提示语 + 结尾部分
                     block["content"] = block["content"][:keep] + f"\n\n[... budgeted: {len(block['content']) - keep * 2} chars truncated ...]\n\n" + block["content"][-keep:]
 
@@ -937,13 +1097,13 @@ class Agent:
         #如果利用率低于 50%，说明空间还很充裕，直接返回，不做任何处理。
         if utilization < 0.5:
             return
-        #动态预算（Budget）：危急状态（>70%）：如果利用率很高，允许单个工具结果保留 15,000 个字符。
-        # 警戒状态（50%-70%）：如果利用率中等，只允许保留 30000 个字符。
-        budget = 15000 if utilization > 0.7 else 30000
+        #动态预算（Budget，单位 token）：危急状态（>70%）：如果利用率很高，允许单个工具结果保留 6000 token。
+        # 警戒状态（50%-70%）：如果利用率中等，只允许保留 12000 token（按 4 字符/token 反推约 48000 字符）。
+        budget = 6000 if utilization > 0.7 else 12000
 
         for msg in self._openai_messages:
-            if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and len(msg["content"]) > budget:
-                keep = (budget - 80) // 2
+            if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and estimate_tokens(msg["content"]) > budget:
+                keep = (budget * 4 - 80) // 2
                 msg["content"] = msg["content"][:keep] + f"\n\n[... budgeted: {len(msg['content']) - keep * 2} chars truncated ...]\n\n" + msg["content"][-keep:]
 
 
@@ -1048,11 +1208,40 @@ class Agent:
     #如果工具返回的结果太大（超过 30KB），不要硬塞进上下文里，而是把它存成一个临时文件。
     # 然后在对话里只留一个‘文件路径’和‘内容预览’。如果模型后面还需要看完整内容，它可以再次调用工具去读取这个文件
 
+    def _cleanup_stale_tool_results(self, directory: Path | str | None = None,
+                                    max_age_s: float = 7 * 86400) -> int:
+        """清理 tool-results 目录中超过 max_age_s 秒的临时文件。
+
+        目录不存在/无权限/单文件删除失败时均静默跳过，不影响正常执行。
+        返回删除的文件数。directory 参数便于测试注入临时目录。
+        """
+        d = Path(directory) if directory else Path.home() / ".otter-code" / "tool-results"
+        if not d.is_dir():
+            return 0
+        cutoff = time.time() - max_age_s
+        removed = 0
+        try:
+            for f in d.iterdir():
+                try:
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        removed += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return removed
+
     def _persist_large_result(self, tool_name: str, result: str) -> str:
         THRESHOLD = 30 * 1024  # 30 KB
         #转换成字节
         if (len (result.encode())) <= THRESHOLD:
             return result
+
+        # 首次写入前清理 7 天前的陈旧临时文件，避免目录无限膨胀。
+        if not self._tool_results_cleaned:
+            self._cleanup_stale_tool_results()
+            self._tool_results_cleaned = True
 
         d = Path.home() / ".otter-code" / "tool-results"
         d.mkdir(parents=True, exist_ok=True)
@@ -1088,16 +1277,70 @@ class Agent:
         else:
             self._anthropic_messages.append({"role": "user", "content": text})
 
+    def _inject_midloop_feedback(self, text: str) -> None:
+        """中途检查点的反馈注入：OpenAI 直接追加 user 消息；
+        Anthropic 合并进最后一条 user 消息（tool_result 消息），
+        避免连续两条 user 消息导致 Anthropic API 报错。"""
+        text = _safe_utf8_text(text)
+        if self.use_openai:
+            self._openai_messages.append({"role": "user", "content": text})
+            return
+        if self._anthropic_messages and self._anthropic_messages[-1].get("role") == "user":
+            last = self._anthropic_messages[-1]
+            content = last.get("content")
+            if isinstance(content, list):
+                content.append({"type": "text", "text": text})
+            else:
+                last["content"] = (content or "") + "\n\n" + text
+        else:
+            self._anthropic_messages.append({"role": "user", "content": text})
+
+    def _checkpoint_interval(self) -> int:
+        """中途 L1 检查点的工具调用间隔（OTTER_VERIFY_CHECKPOINT_EVERY，默认 5，最小 1）。"""
+        try:
+            n = int(os.environ.get("OTTER_VERIFY_CHECKPOINT_EVERY", "5"))
+            return n if n >= 1 else 5
+        except Exception:
+            return 5
+
+    async def _run_checkpoint_verification(self) -> None:
+        """中途 L1 检查点：只对主代理生效，只跑本轮写产物的 L1 规则；
+        失败时注入修复反馈，但不终止循环（轻量、容错）。"""
+        if self.is_sub_agent or self.permission_mode == "plan":
+            return
+        rules = collect_written_file_rules(self._written_files, root=Path.cwd())
+        if not rules:
+            return
+        report = run_verification(rules, cwd=Path.cwd())
+        if report["passed"]:
+            return
+        print_verification(report)
+        self._inject_midloop_feedback(
+            format_verification_feedback(report, attempt=0, max_attempts=get_max_verification_attempts())
+        )
+
+    def _check_timeout(self) -> bool:
+        """wall-clock 超时判断：max_duration_s 不为 None 且已运行超过该时长时返回 True。"""
+        if self.max_duration_s is None:
+            return False
+        return time.monotonic() - self._start_time > self.max_duration_s
+
     async def _verify_before_done(self) -> bool:
         """模型声称完成（不再调用工具）时的验证检查点。
 
         返回 True 表示可以结束本轮：无规则 / 全部通过 / 重试耗尽放行；
         返回 False 表示验证失败，已注入修复反馈，循环应继续。
+        plan 模式只读、无产物，直接放行；子代理不再短路，改为只跑 L1 存在性验证
+        （L2/L3 需要完整执行环境，不适合在子代理内部运行）。
         """
-        if self.is_sub_agent or self.permission_mode == "plan":
+        if self.permission_mode == "plan":
+            self._last_verification_passed = True
             return True
         rules = self._load_active_verification_rules()
+        if self.is_sub_agent:
+            rules = _filter_l1_rules(rules)
         if not rules:
+            self._last_verification_passed = True
             return True
         report = run_verification(rules, cwd=Path.cwd())
         print_verification(report)
@@ -1109,13 +1352,17 @@ class Agent:
             "failures": report["failures"],
         })
         if report["passed"]:
+            self._last_verification_passed = True
             return True
         attempt = len(self._verification_log)
-        if attempt >= MAX_VERIFICATION_ATTEMPTS:
+        max_attempts = get_max_verification_attempts()
+        if attempt >= max_attempts:
             print_error(f"Verification failed after {attempt} attempts; releasing turn (marked unverified).")
+            self._last_verification_passed = False
             return True
-        print_info(f"Verification failed (attempt {attempt}/{MAX_VERIFICATION_ATTEMPTS}); feeding feedback back to model.")
-        self._inject_user_feedback(format_verification_feedback(report, attempt, MAX_VERIFICATION_ATTEMPTS))
+        print_info(f"Verification failed (attempt {attempt}/{max_attempts}); feeding feedback back to model.")
+        self._last_verification_passed = False
+        self._inject_user_feedback(format_verification_feedback(report, attempt, max_attempts))
         return False
 
     async def _run_verification_tool(self, inp: dict) -> str:
@@ -1144,9 +1391,12 @@ class Agent:
         if self._mcp_manager.is_mcp_tool(name):
             return await self._mcp_manager.call_tool(name, inp)
         result = await execute_tool(name, inp, self._read_file_state)
+        # execute_tool 现返回 {"content": str, "error": str|None, "retryable": bool}；
+        # 兼容旧契约：外部 mock / 旧调用方仍可能返回 str（如测试桩），直接透传。
         if name in {"skill_create", "skill_evolve"}:
+            raw = result["content"] if isinstance(result, dict) else result
             try:
-                parsed = json.loads(result)
+                parsed = json.loads(raw)
                 if isinstance(parsed, dict) and parsed.get("ok"):
                     self._refresh_runtime_system_prompt()
             except Exception:
@@ -1156,7 +1406,9 @@ class Agent:
             path = inp.get("file_path")
             if path:
                 self._written_files.add(path)
-        return result
+        if isinstance(result, str):
+            return result
+        return result["content"] or result["error"] or ""
 
 
     async def _execute_skill_tool(self, inp: dict) -> str:
@@ -1185,14 +1437,15 @@ class Agent:
                 custom_system_prompt=result["prompt"],
                 custom_tools=tools,
                 is_sub_agent=True,
-                permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+                permission_mode=self._sub_agent_permission_mode(),
             )
             try:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
                 self.total_input_tokens += sub_result["tokens"]["input"]
                 self.total_output_tokens += sub_result["tokens"]["output"]
                 print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
-                return sub_result["text"] or "(Skill produced no output)"
+                text = sub_result["text"] or "(Skill produced no output)"
+                return self._append_unverified_marker(text, sub_result.get("verified", True))
             except Exception as e:
                 print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
                 return f"Skill fork error: {e}"
@@ -1283,6 +1536,21 @@ class Agent:
             self._openai_messages.append({"role": "system", "content": self._system_prompt})
         self.last_input_token_count = 0
 
+    def _sub_agent_permission_mode(self) -> str:
+        """子代理权限模式：plan 主代理派生的子代理保持只读 plan；
+        其余一律 acceptEdits —— 编辑类工具自动放行，危险 shell 仍走确认
+        （子代理 confirm_fn 为 None 时会被 _confirm_dangerous 拒绝，符合预期）。
+        """
+        return "plan" if self.permission_mode == "plan" else "acceptEdits"
+
+    @staticmethod
+    def _append_unverified_marker(text: str, verified: bool) -> str:
+        """子代理产物未通过 L1 验证时，在返回文本末尾附加 [unverified] 标记，
+        让调用方（主代理）知道结果不可信，避免把未经验证的产物当作完成。"""
+        if verified is False:
+            return f"{text}\n\n[unverified] 子代理产物未通过 L1 验证"
+        return text
+
     async def _execute_agent_tool(self, inp:dict) -> str:
         agent_type = inp.get("type", "general")
         description = inp.get("description", "sub-agent task")
@@ -1297,14 +1565,15 @@ class Agent:
             custom_system_prompt=config["system_prompt"],
             custom_tools=config["tools"],
             is_sub_agent=True,
-            permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+            permission_mode=self._sub_agent_permission_mode(),
         )
         try:
             result = await sub_agent.run_once(prompt)
             self.total_input_tokens += result["tokens"]["input"]
             self.total_output_tokens += result["tokens"]["output"]
             print_sub_agent_end(agent_type, description)
-            return result["text"] or "(Sub-agent produced no output)"
+            text = result["text"] or "(Sub-agent produced no output)"
+            return self._append_unverified_marker(text, result.get("verified", True))
         except Exception as e:
             print_sub_agent_end(agent_type, description)
             return f"Sub-agent error: {e}"
@@ -1331,8 +1600,19 @@ class Agent:
             if self._aborted:
                 break
 
+            # wall-clock 超时（--max-duration）：优雅中止，不抛异常。
+            if self._check_timeout():
+                self._timed_out = True
+                print_error("Max duration reached; stopping agent loop gracefully.")
+                break
+
             # 每轮调用模型前尝试压缩上下文，避免消息历史过长。
             self._run_compression_pipeline()
+
+            # 发送前 token 预估算：若预估总量超过窗口阈值，提前触发摘要压缩。
+            # （_check_and_compact 的 85% 兜底逻辑保留，二者双保险。）
+            if self.estimate_messages_tokens() > self.effective_window - _get_max_output_tokens(self.model) - 1024:
+                await self._compact_conversation()
 
             # 如果记忆预取任务已经完成，就把取回来的 memory 内容追加到最后一条用户消息里。
             # consumed 用来保证同一批 memory 只注入一次。
@@ -1502,8 +1782,20 @@ class Agent:
 
             self._context_cleared = False
 
+            # 中途 L1 检查点：每 N 次工具调用后快速校验写产物存在性（仅主代理生效）。
+            interval = self._checkpoint_interval()
+            if self._tool_call_count > 0 and self._tool_call_count % interval == 0:
+                await self._run_checkpoint_verification()
+
             # 工具结果可能很长，每轮工具执行后检查是否需要压缩上下文。
             await self._check_and_compact()
+
+        # 回收未消费的 memory 预取任务，避免 asyncio task 泄漏（已 consumed 的跳过）。
+        if memory_prefetch and not memory_prefetch.consumed:
+            try:
+                memory_prefetch.task.cancel()
+            except Exception:
+                pass
 
     @staticmethod
     def _block_to_dict(block) -> dict:
@@ -1520,11 +1812,22 @@ class Agent:
         async def _do():
             max_output =  _get_max_output_tokens(self.model)
 
+            # Prompt caching：system 改为带 cache_control 的 block 列表；
+            # tools 在深拷贝的最后一项上追加 cache_control，不修改共享的 self.tools 结构。
+            tools_defs = _sanitize_for_utf8(get_active_tool_definitions(self.tools))
+            if tools_defs:
+                tools_with_cache = list(tools_defs)
+                last_tool = copy.deepcopy(tools_with_cache[-1])
+                last_tool["cache_control"] = {"type": "ephemeral"}
+                tools_with_cache[-1] = last_tool
+            else:
+                tools_with_cache = tools_defs
+
             create_params: dict[str, Any] = {
                 "model": self.model,
                 "max_tokens": max_output if self._thinking_mode != "disabled" else 16384,
-                "system": _safe_utf8_text(self._system_prompt),
-                "tools": _sanitize_for_utf8(get_active_tool_definitions(self.tools)),
+                "system": [{"type": "text", "text": _safe_utf8_text(self._system_prompt), "cache_control": {"type": "ephemeral"}}],
+                "tools": tools_with_cache,
                 "messages": _sanitize_for_utf8(self._anthropic_messages),
             }
             #如果开启了思考模式，就给 Anthropic 请求加上 thinking 参数。
@@ -1619,7 +1922,18 @@ class Agent:
             if self._aborted:
                 break
 
+            # wall-clock 超时（--max-duration）：优雅中止，不抛异常。
+            if self._check_timeout():
+                self._timed_out = True
+                print_error("Max duration reached; stopping agent loop gracefully.")
+                break
+
             self._run_compression_pipeline()
+
+            # 发送前 token 预估算：若预估总量超过窗口阈值，提前触发摘要压缩。
+            # （_check_and_compact 的 85% 兜底逻辑保留，二者双保险。）
+            if self.estimate_messages_tokens() > self.effective_window - _get_max_output_tokens(self.model) - 1024:
+                await self._compact_conversation()
 
             if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
                 memory_prefetch.consumed = True
@@ -1755,7 +2069,20 @@ class Agent:
                                 {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
 
             self._context_cleared = False
+
+            # 中途 L1 检查点：每 N 次工具调用后快速校验写产物存在性（仅主代理生效）。
+            interval = self._checkpoint_interval()
+            if self._tool_call_count > 0 and self._tool_call_count % interval == 0:
+                await self._run_checkpoint_verification()
+
             await self._check_and_compact()
+
+        # 回收未消费的 memory 预取任务，避免 asyncio task 泄漏（已 consumed 的跳过）。
+        if memory_prefetch and not memory_prefetch.consumed:
+            try:
+                memory_prefetch.task.cancel()
+            except Exception:
+                pass
 
     async def _call_openai_stream(self) -> dict:
         async def _do():
@@ -1833,6 +2160,10 @@ class Agent:
         print_confirmation(command)
         if self.confirm_fn:
             return await self.confirm_fn(command)
+        # 子代理没有交互式确认通道：confirm_fn 为 None 时直接拒绝，
+        # 避免在后台/子代理流程中阻塞等待用户输入。
+        if self.is_sub_agent:
+            return False
         # Fallback: blocking input
         try:
             answer = input("  Allow? (y/n): ")

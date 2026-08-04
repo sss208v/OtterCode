@@ -418,6 +418,7 @@ Examples:
         thinking=args.thinking,
         max_cost_usd=args.max_cost,
         max_turns=args.max_turns,
+        max_duration_s=args.max_duration,
         api_base=resolved_api_base if resolved_use_openai else None,
         anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
         api_key=resolved_api_key,
@@ -433,6 +434,7 @@ Examples:
                 agent.restore_session({
                     "anthropicMessages": session.get("anthropicMessages"),
                     "openaiMessages": session.get("openaiMessages"),
+                    "readFileState": session.get("readFileState"),
                 })
             else:
                 print_info("No session found to resume.")

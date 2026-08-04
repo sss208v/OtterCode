@@ -235,3 +235,6 @@ analysis_progress.md
 # Local-only materials (learning handbook, mistake book, local reports, plan drafts)
 # Not uploaded to GitHub; kept for local/agent reading only.
 local/
+
+# Local audit specs (architecture review & memory enhancement specs, local tooling artifacts)
+.trae/

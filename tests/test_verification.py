@@ -259,13 +259,20 @@ class TestAgentVerificationIntegration(unittest.TestCase):
             finally:
                 self._restore_cwd()
 
-    def test_verify_before_done_skips_sub_agent_and_plan_mode(self):
-        a = _make_agent()
-        a.is_sub_agent = True
-        self.assertTrue(asyncio.run(a._verify_before_done()))
+    def test_verify_before_done_skips_plan_mode(self):
+        # plan 阶段只读、无产物，验证直接放行。
         b = _make_agent()
         b.permission_mode = "plan"
         self.assertTrue(asyncio.run(b._verify_before_done()))
+        self.assertTrue(b._last_verification_passed)
+
+    def test_verify_before_done_sub_agent_without_rules_passes(self):
+        # 子代理不再短路：无 L1 规则时仍放行（无规则 → True）。
+        a = _make_agent()
+        a.is_sub_agent = True
+        with patch("agents.agent.load_verification_rules", return_value=[]):
+            self.assertTrue(asyncio.run(a._verify_before_done()))
+        self.assertTrue(a._last_verification_passed)
 
     def test_auto_save_includes_verification_log(self):
         a = _make_agent()
@@ -305,7 +312,7 @@ class TestAgentVerificationIntegration(unittest.TestCase):
 
 
 class TestRunVerificationPermission(unittest.TestCase):
-    """run_verification 权限：default 放行（只读验证），plan 模式拒绝（无产物可验）。"""
+    """run_verification 权限：default/acceptEdits/plan 均放行（只读验证）。"""
 
     def setUp(self):
         self._saved_rules = tools._cached_rules
@@ -322,9 +329,10 @@ class TestRunVerificationPermission(unittest.TestCase):
         result = tools.check_permission("run_verification", {}, mode="acceptEdits")
         self.assertEqual(result["action"], "allow")
 
-    def test_plan_mode_denies(self):
+    def test_plan_mode_allows(self):
+        # P0 加固（Task 13.4）：run_verification 是只读验证，plan 模式放行
         result = tools.check_permission("run_verification", {}, mode="plan")
-        self.assertEqual(result["action"], "deny")
+        self.assertEqual(result["action"], "allow")
 
 
 if __name__ == "__main__":

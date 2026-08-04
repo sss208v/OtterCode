@@ -28,17 +28,20 @@
 
 ## 危险区：agents/tools.py 的权限模式语义
 
-`tools.py` 中的权限系统是安全关键路径，改动前必须先读懂现有语义（`PermissionMode`、`check_permission`、`DANGEROUS_PATTERNS`、`is_dangerous`）：
+`tools.py` 中的权限系统是安全关键路径，改动前必须先读懂现有语义（`PermissionMode`、`check_permission`、`DANGEROUS_PATTERNS`、`is_dangerous`、`HARD_BLOCKLIST`、`is_hard_blocked`、`_is_within_workspace`）：
 
 - 权限模式共五种：`default`、`plan`、`acceptEdits`、`bypassPermissions`、`dontAsk`（`tools.py` 中 `PermissionMode` 定义）
-- `bypassPermissions`（对应 CLI `--yolo`）跳过一切检查，直接放行
-- `plan` 模式：编辑类工具只允许写计划文件，其余编辑与 `run_shell` 一律拒绝
-- `acceptEdits`（对应 CLI `--accept-edits`）：自动放行编辑类工具
-- `default`：危险命令（匹配 `DANGEROUS_PATTERNS`，如 `rm`、`git push/reset/clean`、`Stop-Process` 等）、新建文件、`skill_evolve`、`skill_create` 需要用户确认
+- `bypassPermissions`（对应 CLI `--yolo`）跳过用户确认，但仍执行硬黑名单检测；`HARD_BLOCKLIST` 命中的不可逆命令（`rm -rf /`、`mkfs`、`dd of=/dev/`、`> /dev/sd`、Windows `Format-Volume`/`Clear-Disk` 等）一律拒绝，`bypassPermissions` 也不例外
+- `plan` 模式：编辑类工具只允许写计划文件，其余编辑与 `run_shell` 一律拒绝；`run_verification` 是只读操作，plan 模式允许
+- `acceptEdits`（对应 CLI `--accept-edits`）：自动放行编辑类工具，但越界路径（workspace 外）与硬黑名单命令仍拒绝
+- `default`：危险命令（匹配 `DANGEROUS_PATTERNS`，如 `rm`、`git push/reset/clean`、`curl|sh`、`pip/npm install`、`Stop-Process` 等）、新建文件、越界路径、`skill_evolve`、`skill_create` 需要用户确认
 - `dontAsk`（对应 CLI `--dont-ask`）：所有本应确认的操作自动拒绝
-- 用户/项目 `.otter/settings.json` 中的 `permissions.deny` 规则优先于 `allow`，两者都优先于模式默认行为（`bypassPermissions` 除外）
+- 用户/项目 `.otter/settings.json` 中的 `permissions.deny` 规则优先于 `allow`，两者都优先于模式默认行为（`bypassPermissions` 与 `HARD_BLOCKLIST` 除外）
+- workspace 路径沙箱：`read_file`/`write_file`/`edit_file`/`file_stats`/`list_files`/`grep_search` 只能访问 cwd 子树内路径；越界时 default 需确认、dontAsk/plan/acceptEdits 拒绝、bypassPermissions 放行
+- 权限决策审计：`check_permission` 每次决策（allow/deny/confirm）写入 `.otter/logs/permissions.log`，供事后追溯
+- 子代理权限：`agent`/`skill` fork 子代理统一使用 `acceptEdits`（`_sub_agent_permission_mode`），不再继承 `bypassPermissions`；子代理 `confirm_fn` 为空时危险操作自动拒绝
 
-对这些分支的任何改动都必须补充或更新 `tests/test_tools_permissions.py` 中的对应用例，不允许无回归信号地修改。
+对这些分支的任何改动都必须补充或更新 `tests/test_tools_permissions.py` 中的对应用例，不允许无回归信号地修改。`agent.py` 中涉及子代理权限、验证、重试、超时的改动必须补充 `tests/test_agent_harness_enhance.py` 对应用例。
 
 ## 变更后必须执行的验证命令
 

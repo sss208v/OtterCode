@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import glob as _glob
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -24,8 +25,22 @@ from typing import Any
 # 项目级验证规则配置文件（相对仓库根）
 DEFAULT_CONFIG_PATH = Path(".otter") / "verification.json"
 
-# 验证最多执行的轮数（含首轮）；超过后放行并标记未通过
+# 验证最多执行的轮数（含首轮）；超过后放行并标记未通过。
+# 运行时请使用 get_max_verification_attempts()（支持 OTTER_VERIFY_MAX_ATTEMPTS 环境变量覆盖）。
 MAX_VERIFICATION_ATTEMPTS = 3
+
+
+def get_max_verification_attempts() -> int:
+    """读取验证最大轮数：环境变量 OTTER_VERIFY_MAX_ATTEMPTS（默认 3；需为 >=1 的整数，非法值回落 3）。
+
+    每轮验证时调用以获取最新值，避免 import 常量后固定死。
+    """
+    raw = os.environ.get("OTTER_VERIFY_MAX_ATTEMPTS", "3").strip()
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return MAX_VERIFICATION_ATTEMPTS
+    return n if n >= 1 else MAX_VERIFICATION_ATTEMPTS
 
 VALID_LEVELS = (1, 2, 3)
 VALID_TYPES = (
@@ -221,11 +236,18 @@ def format_verification_feedback(
     attempt: int,
     max_attempts: int,
 ) -> str:
-    """把失败报告格式化为回传给模型的修复指令（fix loop 的反馈载体）。"""
+    """把失败报告格式化为回传给模型的修复指令（fix loop 的反馈载体）。
+
+    报告开头附带"已通过规则摘要"（Passed rules: ...），避免模型重复已完成的工作；
+    失败列表保持不变。
+    """
+    passed_ids = [str(r.get("id")) for r in report.get("results", []) if r.get("status") == "pass"]
     lines = [
         "[Verification Report] Task is NOT verified yet.",
         f"Attempt {attempt}/{max_attempts}. Fix these issues and re-complete the task:",
     ]
+    if passed_ids:
+        lines.insert(1, f"Passed rules: {', '.join(passed_ids)}")
     for f in report.get("failures", []):
         lines.append(f"- [L{f.get('level', '?')}] {f.get('id', '?')}"
                      f" ({f.get('type', '?')}): {f.get('detail', '')}"
