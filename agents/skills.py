@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .frontmatter import parse_frontmatter
+from .memory import BM25_K1, BM25_B
 from .skill_evolution import (
     create_skill_file,
     evolve_skill_file,
@@ -280,8 +281,8 @@ def retrieve_relevant_skills(
 
     avg_doc_len = sum(len(terms) for _, terms in docs) / max(1, len(docs))
     doc_count = len(docs)
-    k1 = 1.4
-    b = 0.75
+    # 与 memory.py 的 bm25_topk 共用同一组参数常量，避免两份算法参数漂移。
+    k1, b = BM25_K1, BM25_B
     hits: list[dict[str, Any]] = []
     for skill, terms in docs:
         term_counts = Counter(terms)

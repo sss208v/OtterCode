@@ -60,7 +60,7 @@ class TestCheckAndCompactTrigger(unittest.TestCase):
 
 
 class TestBudgetToolResults(unittest.TestCase):
-    """第一级压缩：利用率 <0.5 不动；0.5~0.7 预算 30000；>0.7 预算 15000。"""
+    """第一级压缩：利用率 <0.5 不动；0.5~0.7 预算 12000 token；>0.7 预算 6000 token。"""
 
     def _anthropic_result_msg(self, content: str) -> dict:
         return {
@@ -72,7 +72,7 @@ class TestBudgetToolResults(unittest.TestCase):
         a = _make_agent()
         a.effective_window = 1000
         a.last_input_token_count = 400  # 0.4
-        big = "x" * 40000
+        big = "x" * 100000
         a._anthropic_messages = [self._anthropic_result_msg(big)]
         a._budget_tool_results_anthropic()
         self.assertEqual(a._anthropic_messages[0]["content"][0]["content"], big)
@@ -80,24 +80,49 @@ class TestBudgetToolResults(unittest.TestCase):
     def test_anthropic_budget_30000_between_half_and_70_percent(self):
         a = _make_agent()
         a.effective_window = 1000
-        a.last_input_token_count = 600  # 0.6 -> budget 30000
+        a.last_input_token_count = 600  # 0.6 -> budget 12000 token
         a._anthropic_messages = [
-            self._anthropic_result_msg("x" * 31000),  # 超预算，应截断
-            self._anthropic_result_msg("y" * 20000),  # 未超预算，应保留
+            self._anthropic_result_msg("x" * 200000),  # ≈50000 token，超预算，应截断
+            self._anthropic_result_msg("y" * 20000),  # ≈5000 token，未超预算，应保留
         ]
         a._budget_tool_results_anthropic()
         truncated = a._anthropic_messages[0]["content"][0]["content"]
         self.assertIn("[... budgeted:", truncated)
-        self.assertLess(len(truncated), 31000)
+        self.assertLess(len(truncated), 200000)
         self.assertEqual(a._anthropic_messages[1]["content"][0]["content"], "y" * 20000)
 
     def test_anthropic_budget_tightens_to_15000_above_70_percent(self):
         a = _make_agent()
         a.effective_window = 1000
-        a.last_input_token_count = 750  # 0.75 -> budget 15000
-        a._anthropic_messages = [self._anthropic_result_msg("z" * 20000)]
+        a.last_input_token_count = 750  # 0.75 -> budget 6000 token
+        a._anthropic_messages = [self._anthropic_result_msg("z" * 200000)]
         a._budget_tool_results_anthropic()
         self.assertIn("[... budgeted:", a._anthropic_messages[0]["content"][0]["content"])
+
+    def test_anthropic_budget_triggers_at_exactly_half_utilization(self):
+        # utilization == 0.5 在 <0.5 开区间之外：应触发预算裁剪，且命中宽松档 12000 token。
+        a = _make_agent()
+        a.effective_window = 1000
+        a.last_input_token_count = 500  # 0.5，恰好等于半窗边界
+        big = "x" * 200000
+        a._anthropic_messages = [self._anthropic_result_msg(big)]
+        a._budget_tool_results_anthropic()
+        truncated = a._anthropic_messages[0]["content"][0]["content"]
+        self.assertIn("[... budgeted:", truncated)
+        # 12000 档 keep=(12000*4-80)//2=23960，截断后约 47950+ 字符；6000 档仅约 23950。
+        self.assertGreater(len(truncated), 30000)
+
+    def test_anthropic_budget_stays_loose_at_exactly_70_percent(self):
+        # utilization == 0.7 未超过 >0.7 开区间：预算保持宽松档 12000 token，不收紧到 6000。
+        a = _make_agent()
+        a.effective_window = 1000
+        a.last_input_token_count = 700  # 0.7，恰好等于分档边界
+        big = "x" * 200000
+        a._anthropic_messages = [self._anthropic_result_msg(big)]
+        a._budget_tool_results_anthropic()
+        truncated = a._anthropic_messages[0]["content"][0]["content"]
+        self.assertIn("[... budgeted:", truncated)
+        self.assertGreater(len(truncated), 30000)
 
     def test_openai_budget_truncates_tool_role_message(self):
         a = _make_agent(use_openai=True)
@@ -105,7 +130,7 @@ class TestBudgetToolResults(unittest.TestCase):
         a.last_input_token_count = 600
         a._openai_messages = [
             {"role": "system", "content": "sys"},
-            {"role": "tool", "tool_call_id": "c1", "content": "x" * 31000},
+            {"role": "tool", "tool_call_id": "c1", "content": "x" * 200000},
         ]
         a._budget_tool_results_openai()
         self.assertIn("[... budgeted:", a._openai_messages[1]["content"])
