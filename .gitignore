@@ -45,3 +45,13 @@ local/
 
 # 本地审核 spec
 .trae/
+
+# 浏览器运行产物与工具工作目录
+.playwright-mcp/
+.zcode/
+
+# 个人技能（保留运行时功能，不上传 GitHub；工程技能 code-review/commit-msg 仍跟踪）
+.otter/skills/study-ottercode/
+
+# 评测分析报告（可再生输出物；tools/eval_data/ 因测试依赖保留）
+tools/eval_report.md
