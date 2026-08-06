@@ -191,8 +191,12 @@ def build_system_prompt() -> str:
     """Build the full system prompt from embedded template + dynamic context."""
     from datetime import date
     today = date.today().isoformat()
-    plat = f"{platform.system()} {platform.machine()}"
-    shell = (os.environ.get("ComSpec") or "cmd.exe") if sys.platform == "win32" else os.environ.get("SHELL", "/bin/sh")
+    # OTTER_PLATFORM / OTTER_SHELL 允许跨平台/容器场景覆盖宿主环境信息
+    # （如 OtterCode 在 Linux 容器内运行但宿主是 Windows 时，避免模型误用 cmd 语法）
+    plat = os.environ.get("OTTER_PLATFORM") or f"{platform.system()} {platform.machine()}"
+    shell = os.environ.get("OTTER_SHELL") or (
+        (os.environ.get("ComSpec") or "cmd.exe") if sys.platform == "win32" else os.environ.get("SHELL", "/bin/sh")
+    )
     git_context = get_git_context()
     claude_md = load_claude_md()
     memory_section = build_memory_prompt_section()

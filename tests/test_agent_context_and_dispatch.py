@@ -7,8 +7,10 @@
 # 仅使用标准库 unittest，运行方式：python -m unittest discover -s tests
 
 import asyncio
+import os
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from agents import agent as agent_mod
@@ -426,6 +428,37 @@ class TestExecuteToolCallDispatch(unittest.TestCase):
                           new=AsyncMock(return_value="not-json")):
             asyncio.run(a._execute_tool_call("skill_create", {"name": "demo"}))
         a._refresh_runtime_system_prompt.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestPlatformOverride(unittest.TestCase):
+    """OTTER_PLATFORM / OTTER_SHELL 环境变量覆盖宿主平台信息（容器/跨平台场景）。"""
+
+    def test_env_override_replaces_platform_and_shell(self) -> None:
+        from agents import prompt
+
+        with patch.dict(
+            os.environ,
+            {"OTTER_PLATFORM": "Linux x86_64", "OTTER_SHELL": "/bin/bash"},
+            clear=False,
+        ):
+            with patch("agents.prompt.get_git_context", return_value=""), patch(
+                "agents.prompt.load_claude_md", return_value=""
+            ), patch("agents.prompt.build_memory_prompt_section", return_value=""), patch(
+                "agents.prompt.build_skill_descriptions", return_value=""
+            ), patch(
+                "agents.prompt.build_agent_descriptions", return_value=""
+            ), patch(
+                "agents.prompt.get_deferred_tool_names", return_value=[]
+            ), patch(
+                "agents.prompt.Path.cwd", return_value=Path("/app")
+            ):
+                text = prompt.build_system_prompt()
+        self.assertIn("Platform: Linux x86_64", text)
+        self.assertIn("Shell: /bin/bash", text)
 
 
 if __name__ == "__main__":
