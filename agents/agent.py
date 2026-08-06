@@ -111,6 +111,78 @@ def _dedupe_openai_messages(messages: list[dict]) -> list[dict]:
     return deduped
 
 
+def _is_openai_style_messages(messages: list) -> bool:
+    """格式判定：存在 tool 角色消息或 assistant 的 tool_calls 字段 → OpenAI 格式。"""
+    return any(
+        isinstance(m, dict) and (m.get("role") == "tool" or m.get("tool_calls"))
+        for m in messages
+    )
+
+
+def _strip_unpaired_tool_blocks(messages: list[dict]) -> list[dict]:
+    """清洗发送给摘要模型的请求消息，保证协议合法（无孤立工具块、角色交替）：
+
+    - Anthropic 格式：逐条消息移除 tool_use/tool_result block，过滤后无内容的消息丢弃；
+    - OpenAI 格式：移除 assistant 消息的 tool_calls 字段、丢弃 tool 角色消息，
+      内容为空的消息丢弃；
+    - 两种格式均做相邻同角色消息合并（丢弃后者），保证角色交替。
+
+    不修改传入列表（逐条浅拷贝）。
+    """
+    if not messages:
+        return []
+    is_openai = _is_openai_style_messages(messages)
+    cleaned: list[dict] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        msg = dict(msg)
+        if is_openai:
+            if msg.get("role") == "tool":
+                continue
+            msg.pop("tool_calls", None)
+            content = msg.get("content")
+            if content is None or content == "":
+                continue
+        else:
+            content = msg.get("content")
+            if isinstance(content, list):
+                kept = [
+                    block for block in content
+                    if not (isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result"))
+                ]
+                if not kept:
+                    continue  # 过滤后无内容 → 丢弃消息
+                msg["content"] = kept
+            elif not content:
+                continue  # 空内容消息丢弃
+        cleaned.append(msg)
+
+    # 相邻同角色消息合并（丢弃后者），保证角色交替约束。
+    merged: list[dict] = []
+    for msg in cleaned:
+        if merged and merged[-1].get("role") == msg.get("role"):
+            continue
+        merged.append(msg)
+    return merged
+
+
+def _append_user_text_merged(messages: list[dict], text: str) -> list[dict]:
+    """向消息列表追加 user 文本；末尾已是 user 时合并（list 追加 text block /
+    str 拼接）而非新增一条，避免连续两条 user 消息违反角色交替约束
+    （参照 _inject_midloop_feedback 的合并写法）。直接修改并返回 messages。"""
+    if messages and messages[-1].get("role") == "user":
+        last = messages[-1]
+        content = last.get("content")
+        if isinstance(content, list):
+            content.append({"type": "text", "text": text})
+        else:
+            last["content"] = (content or "") + "\n\n" + text
+    else:
+        messages.append({"role": "user", "content": text})
+    return messages
+
+
 async def _with_retry(fn, max_retries: int = 3):
     for attempt in range(max_retries + 1):
         try:
@@ -903,8 +975,36 @@ class Agent:
                 i += 2
                 continue
 
+            # 半截轮连带丢弃：assistant 因结果不完整被跳过时，若紧随其后的 user
+            # 消息内容全为指向这些孤儿 tool_use 的 tool_result（无文本），一并跳过，
+            # 避免恢复后的历史残留孤立 tool_result（后续发送触发 400）。
+            if self._is_orphan_tool_result_follower(next_msg, tool_use_ids):
+                i += 2
+                continue
+
             i += 1
         return normalized
+
+    @staticmethod
+    def _is_orphan_tool_result_follower(next_msg: dict | None, skipped_tool_use_ids: set[str]) -> bool:
+        """判断紧随被跳过 assistant 的消息是否为纯孤儿 tool_result 消息：
+        role 为 user、内容全为 tool_result block（无文本等其他 block）、
+        且每个 tool_use_id 都属于被跳过的 assistant。"""
+        if not next_msg or not skipped_tool_use_ids:
+            return False
+        if next_msg.get("role") != "user" or not isinstance(next_msg.get("content"), list):
+            return False
+        blocks = next_msg["content"]
+        if not blocks:
+            return False
+        for block in blocks:
+            if not isinstance(block, dict):
+                return False
+            if block.get("type") != "tool_result":
+                return False  # 含文本等其他 block → 保留（文本有价值）
+            if block.get("tool_use_id") not in skipped_tool_use_ids:
+                return False  # 指向其他 assistant 的结果 → 保留
+        return True
 
     @staticmethod
     def _anthropic_tool_use_ids(msg: dict | None) -> set[str]:
@@ -1049,16 +1149,18 @@ class Agent:
             return
 
         last_user_msg = self._anthropic_messages[-1]
+        # 摘要请求清洗：移除孤立 tool_use/tool_result block、空消息与连续同角色，
+        # 保证工具轮之后触发压缩不产生 400。
+        cleaned = _strip_unpaired_tool_blocks(_sanitize_for_utf8(self._anthropic_messages[:-1]))
+        request_messages = _append_user_text_merged(
+            cleaned,
+            "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work.",
+        )
         summary_resp = await self._anthropic_client.messages.create(
             model=self.model,
             max_tokens=2048,
             system ="You are a conversation summarizer. Be concise but preserve important details.",
-            messages=[
-                *_sanitize_for_utf8(self._anthropic_messages[:-1]),
-                {"role":"user",
-                 "content":"Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work."
-                }
-            ],
+            messages=request_messages,
         )
         summary_text = summary_resp.content[0].text if summary_resp.content and  summary_resp.content[0].type == "text" else "No summary available."
         # 摘要回写 project 记忆（不修改消息结构，只在外部写文件）。
@@ -1067,8 +1169,10 @@ class Agent:
             {"role":"user","content":f"[Previous conversation summary]\n{summary_text}"},
             {"role": "assistant", "content": "Understood. I have the context from our previous conversation. How can I continue helping?"},
         ]
-        if last_user_msg.get("role") == "user":
-            self._anthropic_messages.append(last_user_msg)
+        # 追加最后一条 user 消息前同样清洗（含 tool_result 的 user 只保留文本）。
+        stripped_last = _strip_unpaired_tool_blocks([last_user_msg])
+        if stripped_last and stripped_last[0].get("role") == "user":
+            self._anthropic_messages.append(stripped_last[0])
         self.last_input_token_count=0
 
     async def _compact_openai(self)->None:
@@ -1076,14 +1180,19 @@ class Agent:
             return
         system_msg = self._openai_messages[0]
         last_user_msg = self._openai_messages[-1]
+        # 摘要请求清洗：移除 assistant 的 tool_calls 字段、tool 角色消息与空消息，
+        # 保证任何工具轮之后触发压缩均不产生 400。
+        cleaned = _strip_unpaired_tool_blocks(_sanitize_for_utf8(self._openai_messages[1:-1]))
+        request_messages = [
+            {"role": "system", "content": "You are a conversation summarizer. Be concise but preserve important details."},
+            *_append_user_text_merged(
+                cleaned,
+                "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work.",
+            ),
+        ]
         summary_resp = await self._openai_client.chat.completions.create(
             model=self.model,
-            messages =[
-                {"role": "system", "content": "You are a conversation summarizer. Be concise but preserve important details."},
-                *self._openai_messages[1:-1],
-                {"role": "user","content": "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work."},
-
-            ],
+            messages=request_messages,
         )
         summary_text = summary_resp.choices[0].message.content or "" if summary_resp.choices else ""
         # 摘要回写 project 记忆（不修改消息结构，只在外部写文件）。
@@ -1093,8 +1202,10 @@ class Agent:
             {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
             {"role": "assistant","content": "Understood. I have the context from our previous conversation. How can I continue helping?"},
         ]
-        if last_user_msg.get("role") == "user":
-            self._openai_messages.append(last_user_msg)
+        # 追加最后一条 user 消息前同样清洗（tool 角色消息被丢弃）。
+        stripped_last = _strip_unpaired_tool_blocks([last_user_msg])
+        if stripped_last and stripped_last[0].get("role") == "user":
+            self._openai_messages.append(stripped_last[0])
         self.last_input_token_count=0
 
     #多层级压缩流水线
@@ -1336,6 +1447,16 @@ class Agent:
                 last["content"] = (content or "") + "\n\n" + text
         else:
             self._anthropic_messages.append({"role": "user", "content": text})
+
+    def _append_user_text(self, text: str) -> None:
+        """向当前协议的历史追加 user 文本；最后一条已是 user 时合并
+        （list 追加 text block / str 拼接）而非新增一条，避免连续两条
+        user 消息违反角色交替（参照 _inject_midloop_feedback 写法）。"""
+        text = _safe_utf8_text(text)
+        if self.use_openai:
+            _append_user_text_merged(self._openai_messages, text)
+        else:
+            _append_user_text_merged(self._anthropic_messages, text)
 
     def _checkpoint_interval(self) -> int:
         """中途 L1 检查点的工具调用间隔（OTTER_VERIFY_CHECKPOINT_EVERY，默认 5，最小 1）。"""
@@ -1625,7 +1746,9 @@ class Agent:
         self._anthropic_messages = self._normalize_anthropic_messages(_sanitize_for_utf8(self._anthropic_messages))
         user_message = _safe_utf8_text(user_message)
         # 先把本轮用户输入放入 Anthropic 消息历史，后续每轮模型调用都会带上这段上下文。
-        self._anthropic_messages.append({"role": "user", "content": user_message})
+        # 最后一条已是 user（如 budget 分支的 tool_result 结尾）时合并而非新增，
+        # 避免连续两条 user 消息导致 Anthropic API 报错。
+        self._append_user_text(user_message)
 
         # 异步内存预取：主 agent 才需要查 memory，sub agent 不额外注入记忆。
         # 这里只启动后台任务，不阻塞当前模型调用流程。
@@ -1697,6 +1820,10 @@ class Agent:
             def _on_tool_block(block:dict):
                 # 流式响应中一旦完整收到 tool_use block，如果工具是并发安全且权限允许，
                 # 就可以提前开始执行，减少等待完整模型响应后的空档时间。
+                # 同轮重复触发同一 id（网关重放 content_block_stop）直接忽略，
+                # 避免创建第二个 early task 导致重复执行。
+                if block["id"] in early_executions:
+                    return
                 if block["name"] in CONCURRENCY_SAFE_TOOLS:
                     perm = check_permission(block["name"], block["input"], self.permission_mode, self._plan_file_path)
                     if perm["action"]=="allow":
@@ -1719,10 +1846,16 @@ class Agent:
             tool_uses = [b for b in response.content if b.type == "tool_use"]
 
             # 把模型返回的所有 content block 写入消息历史，后续 tool_result 要与这些 tool_use 对应。
-            self._anthropic_messages.append({
-                "role": "assistant",
-                "content": [self._block_to_dict(b) for b in response.content],
-            })
+            # 网关重放重复 id 时按 id 去重（保留首个），保证 tool_result 回填一一配对。
+            seen_tool_use_ids: set[str] = set()
+            content_blocks: list[dict] = []
+            for b in response.content:
+                if b.type == "tool_use":
+                    if b.id in seen_tool_use_ids:
+                        continue
+                    seen_tool_use_ids.add(b.id)
+                content_blocks.append(self._block_to_dict(b))
+            self._anthropic_messages.append({"role": "assistant", "content": content_blocks})
 
             # 没有工具调用，说明模型认为已经完成。进入三层验证检查点：
             # 全部通过才结束；失败则注入反馈让模型修复（fix loop，限次）。
@@ -1755,11 +1888,17 @@ class Agent:
             # 收集本轮所有工具结果，之后作为 tool_result 消息回传给模型。
             tool_results: list[dict] = []
             context_break = False
+            executed_tool_use_ids: set[str] = set()
 
             for tu in tool_uses:
                 # context_break 表示某个工具执行期间清理了上下文，需要停止继续处理本轮剩余工具。
                 if context_break or self._aborted:
                     break
+
+                # 执行层按 id 去重：同一轮重复 id 只执行一次、只回填一次（保留首个）。
+                if tu.id in executed_tool_use_ids:
+                    continue
+                executed_tool_use_ids.add(tu.id)
 
                 # 将工具入参转为普通 dict，便于权限检查、打印和实际执行。
                 inp = dict(tu.input) if hasattr(tu, "items") else tu.input
@@ -1948,7 +2087,8 @@ class Agent:
 
     async def _chat_openai(self, user_message:str) -> None:
         user_message = _safe_utf8_text(user_message)
-        self._openai_messages.append({"role": "user", "content": user_message})
+        # 最后一条已是 user 时合并而非新增，避免连续两条 user 消息。
+        self._append_user_text(user_message)
 
         #预取句柄 MemoryPrefetch
         memory_prefetch: MemoryPrefetch | None = None
@@ -2030,16 +2170,32 @@ class Agent:
             budget = self._check_budget()
             if budget["exceeded"]:
                 print_info(f"Budget exceeded: {budget['reason']}")
+                # 预算超限：为所有 tool_calls 回填 skipped 结果，保证历史
+                # 每个 tool_call 都有对应 tool 消息（无孤儿 tool_calls，不报 400）。
+                for tc in tool_calls:
+                    self._openai_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id"),
+                        "content": f"Tool execution skipped: {budget['reason']}",
+                    })
                 break
 
             # 权限收集阶段：逐个确认/拒绝，allowed/result 在收集时写入 oai_checked。
             oai_checked: list[dict] = []
+            seen_tc_ids: set[str] = set()
             for tc in tool_calls:
                 if self._aborted:
                     break
 
                 if tc.get("type") != "function":
                     continue
+
+                # 执行层按 id 去重：同一轮重复 id 只执行一次、只回填一次（保留首个）。
+                tc_id = tc.get("id")
+                if tc_id is not None:
+                    if tc_id in seen_tc_ids:
+                        continue
+                    seen_tc_ids.add(tc_id)
 
                 fn_name = tc["function"]["name"]
                 try:
@@ -2082,14 +2238,30 @@ class Agent:
 
                 if batch["concurrent"]:
                     async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
-                        raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
+                        try:
+                            raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
+                        except Exception as e:
+                            # 单个工具异常不中断整轮：回填错误消息（与 Anthropic 路径对齐）。
+                            raw = f"Error executing tool: {e}"
                         raw = _safe_utf8_text(raw)
                         res = self._persist_large_result(ct_item["fn"], raw)
                         print_tool_result(ct_item["fn"], res)
                         return ct_item, res
 
-                    results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
-                    for ct_item, res in results:
+                    results = await asyncio.gather(
+                        *[_run_oai_safe(ct) for ct in batch["items"]],
+                        return_exceptions=True,
+                    )
+                    # gather 保序返回（每项即 _run_oai_safe 的 (ct_item, res) 元组），
+                    # 逐个处理；异常项按索引回填错误，不中断整轮。
+                    for index, result in enumerate(results):
+                        if isinstance(result, Exception):
+                            # 极端兜底：任务级异常（正常不会走到）同样回填错误。
+                            self._openai_messages.append(
+                                {"role": "tool", "tool_call_id": batch["items"][index]["tc"]["id"],
+                                 "content": f"Error executing tool: {result}"})
+                            continue
+                        ct_item, res = result
                         self._openai_messages.append(
                             {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
                 else:
@@ -2099,7 +2271,10 @@ class Agent:
                                 {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
                             continue
 
-                        raw = await self._execute_tool_call(ct["fn"], ct["inp"])
+                        try:
+                            raw = await self._execute_tool_call(ct["fn"], ct["inp"])
+                        except Exception as e:
+                            raw = f"Error executing tool: {e}"
                         raw = _safe_utf8_text(raw)
                         res = self._persist_large_result(ct["fn"], raw)
                         print_tool_result(ct["fn"], res)
