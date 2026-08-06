@@ -10,6 +10,7 @@ from typing import Any
 
 from .frontmatter import parse_frontmatter
 from .memory import BM25_K1, BM25_B
+from .tokenizer import tokenize
 from .skill_evolution import (
     create_skill_file,
     evolve_skill_file,
@@ -193,57 +194,6 @@ def build_skill_descriptions() -> str:
     return "\n".join(lines)
 
 
-_TOKEN_RE = re.compile(r"[a-zA-Z0-9]+|[\u4e00-\u9fff]{1,2}")
-_STOP_TOKENS = {
-    "请帮",
-    "帮我",
-    "我做",
-    "做一",
-    "一次",
-    "一下",
-    "这个",
-    "那个",
-    "一个",
-    "用户",
-    "问题",
-    "回答",
-    "生成",
-    "使用",
-    "需要",
-}
-
-
-def _tokens(text: str) -> set[str]:
-    raw = str(text or "").lower().replace("_", " ").replace("-", " ")
-    found = {m.group(0) for m in _TOKEN_RE.finditer(raw)}
-    expanded = set(found)
-    for token in found:
-        if len(token) > 3 and token.endswith("s"):
-            expanded.add(token[:-1])
-    found = expanded
-    cjk = re.findall(r"[\u4e00-\u9fff]+", raw)
-    for chunk in cjk:
-        if len(chunk) >= 2:
-            found.update(chunk[i : i + 2] for i in range(len(chunk) - 1))
-    return {x for x in found if x.strip() and x not in _STOP_TOKENS}
-
-
-def _token_list(text: str) -> list[str]:
-    raw = str(text or "").lower().replace("_", " ").replace("-", " ")
-    tokens = [m.group(0) for m in _TOKEN_RE.finditer(raw)]
-    for chunk in re.findall(r"[\u4e00-\u9fff]+", raw):
-        if len(chunk) >= 2:
-            tokens.extend(chunk[i : i + 2] for i in range(len(chunk) - 1))
-    expanded: list[str] = []
-    for token in tokens:
-        if not token.strip() or token in _STOP_TOKENS:
-            continue
-        expanded.append(token)
-        if len(token) > 3 and token.endswith("s"):
-            expanded.append(token[:-1])
-    return expanded
-
-
 def _skill_search_text(skill: SkillDefinition) -> str:
     return "\n".join(
         [
@@ -261,7 +211,7 @@ def retrieve_relevant_skills(
     limit: int = 3,
     min_score: float = 0.08,
 ) -> list[dict[str, Any]]:
-    query_terms = _token_list(query)
+    query_terms = tokenize(query)
     query_tokens = set(query_terms)
     if not query_tokens:
         return []
@@ -269,8 +219,8 @@ def retrieve_relevant_skills(
     docs: list[tuple[SkillDefinition, list[str]]] = []
     document_frequency: Counter[str] = Counter()
     for skill in discover_skills():
-        meta_terms = _token_list("\n".join([skill.name, skill.description, skill.when_to_use or ""]))
-        body_terms = _token_list(skill.prompt_template[:2500])
+        meta_terms = tokenize("\n".join([skill.name, skill.description, skill.when_to_use or ""]))
+        body_terms = tokenize(skill.prompt_template[:2500])
         terms = (meta_terms * 3) + body_terms
         if not terms:
             continue

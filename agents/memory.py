@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .frontmatter import parse_frontmatter, format_frontmatter
+from .tokenizer import tokenize
 from typing import Callable
 # side query 是一个异步函数：输入 system prompt 和 user prompt，返回模型文本。
 # 这里标成 Any 是为了避免在运行时引入复杂 Awaitable 类型约束。
@@ -311,8 +312,8 @@ def _safe_float(value: Any, default: float) -> float:
 
 
 def _tokenize(text: str) -> list[str]:
-    """简单 tokenize：按非字母数字切分、小写化（与 bm25_topk 一致）。"""
-    return re.findall(r"[a-z0-9]+", text.lower())
+    """与 skills 检索共用的共享分词器：英文按词切分、中文 2-gram + 停用词（见 tokenizer.py）。"""
+    return tokenize(text)
 
 
 def _tokenize_body_preview(body: str) -> list[str]:
@@ -384,7 +385,7 @@ def bm25_topk(
     exclude 是已展示过的 file_path 集合，命中的文件直接跳过。
     query 无 token 或所有 header 得分为 0 时返回空列表，不做模糊降级。
     """
-    query_tokens = re.findall(r"[a-z0-9]+", query.lower())
+    query_tokens = _tokenize(query)
     if not query_tokens:
         return []
 

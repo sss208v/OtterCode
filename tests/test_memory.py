@@ -2,7 +2,7 @@
 # 针对 agents/memory.py 记忆系统与上下文管理增强的回归测试：
 #   1. save_memory_structured 结构化保存：frontmatter 元数据齐全 / type 与字段非空校验 / 同名去重更新
 #   2. update_memory_index 索引原子写（temp + os.replace，不残留 .tmp）
-#   3. bm25_topk 关键词预筛：相关性排序 / 无命中返回空 / exclude 生效
+#   3. bm25_topk 关键词预筛：相关性排序 / 无命中返回空 / exclude 生效 / 中文 query 经共享 2-gram 分词召回
 #   4. select_relevant_memories 混合检索：候选 ≤5 跳过 LLM / 无命中返回空 / LLM 失败降级 / 预算封顶截断
 #   5. estimate_tokens 近似 token 估算（CJK 每字 1.5，ASCII 4 字符/token）
 # 仅使用标准库 unittest + unittest.mock + tempfile，运行方式：python -m unittest discover -s tests
@@ -165,6 +165,56 @@ class TestBM25TopK(_MemoryDirTestCase):
         dep = self._header("project_2.md", "deployment pipeline guide")
         result = memory.bm25_topk("database", [db, dep], exclude={db.file_path})
         self.assertEqual(result, [])
+
+
+class TestBM25Chinese(_MemoryDirTestCase):
+    """中文 query 经共享 2-gram 分词器参与 BM25 预筛（此前纯 ASCII 正则中文全丢）。"""
+
+    def _header(self, filename: str, description: str):
+        return memory.MemoryHeader(
+            filename=filename,
+            file_path=str(self._dir / filename),
+            mtime_ms=time.time() * 1000,
+            description=description,
+            type="project",
+        )
+
+    def test_chinese_description_recall(self):
+        db = self._header("project_1.md", "数据库连接池的配置说明")
+        other = self._header("project_2.md", "dessert recipes")
+        result = memory.bm25_topk("数据库连接池怎么配置", [db, other])
+        self.assertEqual(result[0].filename, "project_1.md")
+
+    def test_chinese_query_stopwords_filtered(self):
+        # "帮我" 是停用词，过滤后仍能靠"数据库连接池"命中。
+        db = self._header("project_1.md", "数据库连接池的配置说明")
+        other = self._header("project_2.md", "dessert recipes")
+        result = memory.bm25_topk("帮我看看数据库连接池", [db, other])
+        self.assertEqual(result[0].filename, "project_1.md")
+
+    def test_chinese_query_no_hit_returns_empty(self):
+        db = self._header("project_1.md", "数据库连接池的配置说明")
+        # 中文 query 无重叠 token 时与英文一样返回空，不做模糊降级。
+        self.assertEqual(memory.bm25_topk("奥特尔码特检索增强", [db]), [])
+
+    def test_english_still_works_after_shared_tokenizer(self):
+        # 回归：接入共享分词器后英文检索行为不变。
+        db = self._header("project_1.md", "database schema notes")
+        dep = self._header("project_2.md", "deployment pipeline guide")
+        result = memory.bm25_topk("database", [db, dep])
+        self.assertEqual(result[0].filename, "project_1.md")
+
+    def test_chinese_body_recall(self):
+        # 正文含中英混排时经 body_tokens 召回。
+        self._write_memory("reference_cn.md", "cn note", "misc note",
+                           body="这里记录 sqlite 本地存储的使用经验")
+        self._write_memory("reference_other.md", "other note", "misc note",
+                           body="nothing about databases here")
+        headers = memory.scan_memory_headers()
+        cn = next(h for h in headers if h.filename == "reference_cn.md")
+        self.assertIn("sqlite", cn.body_tokens)
+        result = memory.bm25_topk("sqlite", headers)
+        self.assertEqual(result[0].filename, "reference_cn.md")
 
 
 class TestSelectRelevantMemories(_MemoryDirTestCase):
