@@ -25,14 +25,14 @@ except ImportError:
     from agents.memory import MemoryPrefetch, start_memory_prefetch, format_memories_for_injection
     save_memory_structured = None
 from agents.prompt import build_system_prompt
-from agents.session import save_session
+from agents.session import load_session, save_session
 from agents.subagent import get_sub_agent_config
 from agents.tools import ToolDef, tool_definitions, execute_tool, CONCURRENCY_SAFE_TOOLS, check_permission, \
     get_active_tool_definitions
 from agents.verification import (collect_written_file_rules, format_verification_feedback,
                                 get_max_verification_attempts, load_verification_rules,
                                 run_verification)
-from agents.ui import print_info, print_divider, print_assistant_text, print_sub_agent_start, print_sub_agent_end, \
+from agents.ui import print_info, print_divider, print_assistant_text, print_thinking, print_sub_agent_start, print_sub_agent_end, \
     start_spinner, stop_spinner, print_cost, print_tool_call, print_tool_result, print_confirmation, print_retry, \
     print_error, print_verification
 
@@ -1031,14 +1031,29 @@ class Agent:
 
     def _auto_save(self) -> None:
         try:
+            # 保留用户自定义标题（webui 重命名写入 metadata.title），避免每次落盘覆盖掉
+            custom_title = None
+            try:
+                old = load_session(self.session_id)
+                if old:
+                    custom_title = (old.get("metadata") or {}).get("title")
+            except Exception:
+                pass
+            metadata: dict = {
+                "id": self.session_id,
+                "model": self.model,
+                "cwd": str(Path.cwd()),
+                "startTime": self.session_start_time,
+                "messageCount": self._get_message_count(),
+                # 任务级单元：首条 user 消息首行截断 60 字（会话代表的任务）
+                "task": self._session_task(),
+                # 结果判定：最近一次验证 passed → pass；失败 → fail；无验证 → unknown
+                "outcome": self._session_outcome(),
+            }
+            if custom_title:
+                metadata["title"] = custom_title
             save_session(self.session_id, {
-                "metadata": {
-                    "id": self.session_id,
-                    "model": self.model,
-                    "cwd": str(Path.cwd()),
-                    "startTime": self.session_start_time,
-                    "messageCount": self._get_message_count(),
-                },
+                "metadata": metadata,
                 "anthropicMessages": _sanitize_for_utf8(self._anthropic_messages) if not self.use_openai else None,
                 "openaiMessages": _sanitize_for_utf8(self._openai_messages) if self.use_openai else None,
                 "verification": self._verification_log or None,
@@ -1046,6 +1061,26 @@ class Agent:
             })
         except Exception:
             pass
+
+    def _session_task(self, limit: int = 60) -> str:
+        """从消息历史提取首条 user 文本作为任务标识（失败轨迹分析用）。"""
+        for msg in self._anthropic_messages or self._openai_messages:
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str):
+                continue
+            first_line = content.strip().split("\n", 1)[0]
+            text = re.sub(r"<[^>]+>", "", first_line).strip()
+            if text:
+                return text[:limit] + ("…" if len(text) > limit else "")
+        return ""
+
+    def _session_outcome(self) -> str:
+        """结果判定：pass / fail / unknown（依据最近一次验证）。"""
+        if not self._verification_log:
+            return "unknown"
+        return "pass" if self._verification_log[-1].get("passed") else "fail"
 
     def _persist_compact_summary(self, summary_text: str) -> None:
         """将摘要压缩产生的会话摘要回写为 project 类型记忆。失败静默。
@@ -1513,6 +1548,8 @@ class Agent:
             "passed": report["passed"],
             "total": report["total"],
             "failures": report["failures"],
+            # 失败轨迹关联键：验证触发时的消息位置（定位失败轮次对应的动作序列）
+            "message_index": len(self._anthropic_messages) if not self.use_openai else len(self._openai_messages),
         })
         if report["passed"]:
             self._last_verification_passed = True

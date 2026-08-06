@@ -43,6 +43,12 @@
 
 对这些分支的任何改动都必须补充或更新 `tests/test_tools_permissions.py` 中的对应用例，不允许无回归信号地修改。`agent.py` 中涉及子代理权限、验证、重试、超时的改动必须补充 `tests/test_agent_harness_enhance.py` 对应用例。
 
+## tools/ 目录：分析导出脚本
+
+仓库根 `tools/` 放置只读分析/导出脚本（不参与 Agent 运行时），当前有：
+
+- `tools/export_failure_trajectories.py`：从 `~/.otter-code/sessions/` 会话存档导出失败轨迹为可回放 JSONL（默认只导出 outcome=fail，`--all` 覆盖）；其轨迹提取与过滤逻辑的回归测试在 `tests/test_export_failure_trajectories.py`，改动必须同步更新该测试。
+
 ## 变更后必须执行的验证命令
 
 在仓库根依次运行：

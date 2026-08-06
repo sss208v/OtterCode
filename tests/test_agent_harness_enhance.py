@@ -376,6 +376,64 @@ class TestReadFileStatePersistence(unittest.TestCase):
         a.restore_session({"anthropicMessages": [], "openaiMessages": []})
         self.assertEqual(a._read_file_state, {})
 
+    def test_auto_save_keeps_custom_title(self):
+        # webui 重命名写入 metadata.title 后，_auto_save 不得覆盖掉
+        a = _make_agent()
+        with patch("agents.agent.load_session") as mock_load, patch("agents.agent.save_session") as mock_save:
+            mock_load.return_value = {"metadata": {"id": "x", "title": "自定义标题"}}
+            a._auto_save()
+        data = mock_save.call_args[0][1]
+        self.assertEqual(data["metadata"]["title"], "自定义标题")
+
+    def test_auto_save_no_title_when_absent(self):
+        # 旧会话无 title 时保持原行为（不新增字段）
+        a = _make_agent()
+        with patch("agents.agent.load_session") as mock_load, patch("agents.agent.save_session") as mock_save:
+            mock_load.return_value = {"metadata": {"id": "x"}}
+            a._auto_save()
+        data = mock_save.call_args[0][1]
+        self.assertNotIn("title", data["metadata"])
+
+    def test_auto_save_task_and_outcome_fields(self):
+        # 任务级单元：metadata 含 task（首条 user 消息）与 outcome（最近验证结果）
+        a = _make_agent()
+        a._anthropic_messages = [{"role": "user", "content": "修复登录 bug，这是一个很长的任务描述"}]
+        a._verification_log = [{"attempt": 1, "passed": False, "total": 3, "failures": []}]
+        with patch("agents.agent.load_session") as mock_load, patch("agents.agent.save_session") as mock_save:
+            mock_load.return_value = None
+            a._auto_save()
+        data = mock_save.call_args[0][1]
+        self.assertTrue(data["metadata"]["task"].startswith("修复登录 bug"))
+        self.assertEqual(data["metadata"]["outcome"], "fail")
+        # 无验证记录 → unknown
+        a._verification_log = []
+        with patch("agents.agent.load_session") as mock_load, patch("agents.agent.save_session") as mock_save:
+            mock_load.return_value = None
+            a._auto_save()
+        data = mock_save.call_args[0][1]
+        self.assertEqual(data["metadata"]["outcome"], "unknown")
+
+    def test_verification_log_has_message_index(self):
+        # 失败轨迹关联键：验证条目记录触发时的消息位置
+        l1 = VerificationRule({"id": "l1", "level": 1, "type": "file_exists", "target": "missing.txt"})
+        old_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            try:
+                a = _make_agent()
+                # use_openai 默认 True：失败轨迹关联键取自 openai 消息列表
+                a._openai_messages = [
+                    {"role": "user", "content": "x"},
+                    {"role": "assistant", "content": "y"},
+                ]
+                with patch("agents.agent.load_verification_rules", return_value=[l1]):
+                    asyncio.run(a._verify_before_done())
+                entry = a._verification_log[-1]
+                self.assertFalse(entry["passed"])
+                self.assertEqual(entry["message_index"], 2)
+            finally:
+                os.chdir(old_cwd)
+
 
 class TestRunOnceVerifiedDefault(unittest.TestCase):
     """Task 4: run_once 未触发验证时 verified 默认 True（不依赖完整 chat 循环）。"""

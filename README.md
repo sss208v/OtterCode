@@ -16,6 +16,7 @@ Otter Code 是一个基于 Python 实现的**自进化 Harness Agent**。它不�
 - **MCP 外部工具扩展**：自研 stdio JSON-RPC MCP Client，把外部 MCP Server 工具包装为 `mcp__server__tool`。
 - **子 Agent**：支持 explore、plan、general 以及自定义子 Agent，用隔离上下文完成探索、规划或局部任务。
 - **会话恢复和上下文压缩**：每轮自动保存 session，支持 `--resume`、`/compact`；三级压缩管线按窗口利用率梯度截断/修剪/清理旧工具结果，利用率过高时用模型摘要折叠历史，超大工具结果落盘只留路径与预览。
+- **失败轨迹收集**：每次验证自动记录任务描述、结局（pass/fail）与验证触发的消息位置；`tools/export_failure_trajectories.py` 可从会话存档导出失败轮次为可回放 JSONL（含工具调用与报错），供评测 / 训练 / 复盘分析。
 
 ## 项目架构
 
