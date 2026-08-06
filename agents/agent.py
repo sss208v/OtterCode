@@ -69,6 +69,48 @@ def _sanitize_for_utf8(value: Any) -> Any:
     return value
 
 
+def _dedupe_openai_messages(messages: list[dict]) -> list[dict]:
+    """发送前防御性去重：assistant 消息内 tool_calls 相同 id 只保留首个；
+    tool 角色消息相同 tool_call_id 只保留最先出现者（其余消息原样保留）。
+
+    覆盖恢复会话/旧存档中的脏数据；不修改原消息数组（self._openai_messages
+    保持不变），仅对发送数组生效。
+    """
+    deduped: list[dict] = []
+    seen_tool_call_ids: set[str] = set()
+    for msg in messages:
+        if not isinstance(msg, dict):
+            deduped.append(msg)
+            continue
+        if msg.get("role") == "tool":
+            tid = msg.get("tool_call_id")
+            if tid is not None and tid in seen_tool_call_ids:
+                continue
+            if tid is not None:
+                seen_tool_call_ids.add(tid)
+            deduped.append(msg)
+            continue
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            seen_ids: set[str] = set()
+            kept: list[dict] = []
+            has_dup = False
+            for tc in msg["tool_calls"]:
+                tc_id = tc.get("id") if isinstance(tc, dict) else None
+                if tc_id is not None and tc_id in seen_ids:
+                    has_dup = True
+                    continue
+                if tc_id is not None:
+                    seen_ids.add(tc_id)
+                kept.append(tc)
+            if has_dup:
+                new_msg = dict(msg)
+                new_msg["tool_calls"] = kept
+                deduped.append(new_msg)
+                continue
+        deduped.append(msg)
+    return deduped
+
+
 async def _with_retry(fn, max_retries: int = 3):
     for attempt in range(max_retries + 1):
         try:
@@ -1990,6 +2032,7 @@ class Agent:
                 print_info(f"Budget exceeded: {budget['reason']}")
                 break
 
+            # 权限收集阶段：逐个确认/拒绝，allowed/result 在收集时写入 oai_checked。
             oai_checked: list[dict] = []
             for tc in tool_calls:
                 if self._aborted:
@@ -2022,51 +2065,53 @@ class Agent:
                     self._confirmed_paths.add(perm["message"])
                 oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
 
-                oai_batches: list[dict] = []
-                for ct in oai_checked:
-                    safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
-                    if safe and oai_batches and oai_batches[-1]["concurrent"]:
-                        oai_batches[-1]["items"].append(ct)
-                    else:
-                        oai_batches.append({"concurrent": safe, "items": [ct]})
+            # 批次构建阶段：按 CONCURRENCY_SAFE_TOOLS 把连续并发安全的工具分组。
+            oai_batches: list[dict] = []
+            for ct in oai_checked:
+                safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
+                if safe and oai_batches and oai_batches[-1]["concurrent"]:
+                    oai_batches[-1]["items"].append(ct)
+                else:
+                    oai_batches.append({"concurrent": safe, "items": [ct]})
 
-                oai_context_break = False
-                for batch in oai_batches:
-                    if oai_context_break or self._aborted:
-                        break
+            # 批次执行阶段：每个工具只执行一次、每条 tool 消息只回写一次。
+            oai_context_break = False
+            for batch in oai_batches:
+                if oai_context_break or self._aborted:
+                    break
 
-                    if batch["concurrent"]:
-                        async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
-                            raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
-                            raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct_item["fn"], raw)
-                            print_tool_result(ct_item["fn"], res)
-                            return ct_item, res
+                if batch["concurrent"]:
+                    async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
+                        raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
+                        raw = _safe_utf8_text(raw)
+                        res = self._persist_large_result(ct_item["fn"], raw)
+                        print_tool_result(ct_item["fn"], res)
+                        return ct_item, res
 
-                        results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
-                        for ct_item, res in results:
+                    results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
+                    for ct_item, res in results:
+                        self._openai_messages.append(
+                            {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
+                else:
+                    for ct in batch["items"]:
+                        if not ct["allowed"]:
                             self._openai_messages.append(
-                                {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
-                    else:
-                        for ct in batch["items"]:
-                            if not ct["allowed"]:
-                                self._openai_messages.append(
-                                    {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
-                                continue
+                                {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
+                            continue
 
-                            raw = await self._execute_tool_call(ct["fn"], ct["inp"])
-                            raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct["fn"], raw)
-                            print_tool_result(ct["fn"], res)
+                        raw = await self._execute_tool_call(ct["fn"], ct["inp"])
+                        raw = _safe_utf8_text(raw)
+                        res = self._persist_large_result(ct["fn"], raw)
+                        print_tool_result(ct["fn"], res)
 
-                            if self._context_cleared:
-                                self._context_cleared = False
-                                self._openai_messages.append({"role": "user", "content": res})
-                                oai_context_break = True
-                                break
+                        if self._context_cleared:
+                            self._context_cleared = False
+                            self._openai_messages.append({"role": "user", "content": res})
+                            oai_context_break = True
+                            break
 
-                            self._openai_messages.append(
-                                {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
+                        self._openai_messages.append(
+                            {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
 
             self._context_cleared = False
 
@@ -2089,7 +2134,7 @@ class Agent:
             stream = await self._openai_client.chat.completions.create(
                 model=self.model,
                 tools=_sanitize_for_utf8(_to_openai_tools(get_active_tool_definitions(self.tools))),
-                messages=_sanitize_for_utf8(self._openai_messages),
+                messages=_sanitize_for_utf8(_dedupe_openai_messages(self._openai_messages)),
                 stream=True,
                 stream_options={"include_usage": True},
             )

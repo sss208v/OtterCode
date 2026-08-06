@@ -429,6 +429,150 @@ class TestExecuteToolCallStructuredContract(unittest.TestCase):
         self.assertIn("a.txt", a._written_files)
 
 
+class _FakeChunk:
+    """最小可用的流式 chunk 桩（仅暴露 _call_openai_stream 会访问的属性）。"""
+
+    def __init__(self, content=None, tool_calls=None, finish_reason=None, usage=None):
+        self.usage = usage
+        self.choices = [] if finish_reason is None else [
+            type("_Choice", (), {
+                "delta": type("_Delta", (), {"content": content, "tool_calls": tool_calls})(),
+                "finish_reason": finish_reason,
+            })()
+        ]
+
+
+class _FakeStream:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._chunks:
+            raise StopAsyncIteration
+        return self._chunks.pop(0)
+
+
+class TestOpenAIMultiToolCallOnce(unittest.TestCase):
+    """Task 1: 模型单次返回多个 tool_calls 时，每个工具只执行一次、每条 tool 消息只回写一次。"""
+
+    @staticmethod
+    def _tc(tc_id, name, args=None):
+        return {
+            "id": tc_id,
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args or {})},
+        }
+
+    @staticmethod
+    def _resp(tool_calls):
+        return {
+            "choices": [{"message": {"role": "assistant", "content": "", "tool_calls": tool_calls}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+
+    def test_openai_three_tool_calls_each_executed_once(self):
+        a = _make_agent(is_sub_agent=True)
+        resp1 = self._resp([
+            self._tc("tc1", "tool_a", {"x": 1}),
+            self._tc("tc2", "tool_b", {"x": 2}),
+            self._tc("tc3", "tool_c", {"x": 3}),
+        ])
+        resp2 = self._resp(None)  # 无 tool_calls，结束循环
+        exec_mock = AsyncMock(return_value="ok-result")
+        with (
+            patch.object(Agent, "_call_openai_stream", new=AsyncMock(side_effect=[resp1, resp2])),
+            patch("agents.agent.check_permission", return_value={"action": "allow"}),
+            patch.object(Agent, "_execute_tool_call", new=exec_mock),
+            patch.object(Agent, "_verify_before_done", new=AsyncMock(return_value=True)),
+        ):
+            asyncio.run(a._chat_openai("do three things"))
+
+        # 每个工具恰好执行一次
+        self.assertEqual(exec_mock.call_count, 3)
+        names = [c.args[0] for c in exec_mock.call_args_list]
+        self.assertEqual(sorted(names), ["tool_a", "tool_b", "tool_c"])
+        # 每条 tool 消息只回写一次
+        tool_msgs = [m for m in a._openai_messages if m.get("role") == "tool"]
+        ids = [m["tool_call_id"] for m in tool_msgs]
+        self.assertEqual(ids, ["tc1", "tc2", "tc3"])
+        for tid in ("tc1", "tc2", "tc3"):
+            self.assertEqual(ids.count(tid), 1)
+
+    def test_openai_denied_tool_writes_result_once(self):
+        # 拒绝分支的 result 在收集阶段写入，执行阶段只 append 一次，且不执行工具。
+        a = _make_agent(is_sub_agent=True)
+
+        def _perm(name, inp, mode, plan):
+            return {"action": "deny", "message": "blocked"} if name == "tool_b" else {"action": "allow"}
+
+        resp1 = self._resp([
+            self._tc("tc1", "tool_a", {"x": 1}),
+            self._tc("tc2", "tool_b", {"x": 2}),
+            self._tc("tc3", "tool_c", {"x": 3}),
+        ])
+        resp2 = self._resp(None)
+        exec_mock = AsyncMock(return_value="ok-result")
+        with (
+            patch.object(Agent, "_call_openai_stream", new=AsyncMock(side_effect=[resp1, resp2])),
+            patch("agents.agent.check_permission", side_effect=_perm),
+            patch.object(Agent, "_execute_tool_call", new=exec_mock),
+            patch.object(Agent, "_verify_before_done", new=AsyncMock(return_value=True)),
+        ):
+            asyncio.run(a._chat_openai("do three things"))
+
+        # 被拒绝的工具不执行，其余各执行一次
+        self.assertEqual(exec_mock.call_count, 2)
+        names = [c.args[0] for c in exec_mock.call_args_list]
+        self.assertEqual(sorted(names), ["tool_a", "tool_c"])
+        # 三条 tool 消息各一次，拒绝消息保留
+        tool_msgs = [m for m in a._openai_messages if m.get("role") == "tool"]
+        ids = [m["tool_call_id"] for m in tool_msgs]
+        self.assertEqual(ids, ["tc1", "tc2", "tc3"])
+        denied = [m for m in tool_msgs if m["tool_call_id"] == "tc2"]
+        self.assertEqual(denied[0]["content"], "Action denied: blocked")
+
+
+class TestOpenAISendDedupe(unittest.TestCase):
+    """Task 2: _call_openai_stream 发送前对消息历史做 tool_call_id 去重（不改动原历史）。"""
+
+    def test_openai_dedup_tool_call_ids_before_send(self):
+        a = _make_agent()
+        a._openai_messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "tc1", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+                {"id": "tc2", "type": "function", "function": {"name": "b", "arguments": "{}"}},
+                {"id": "tc1", "type": "function", "function": {"name": "c", "arguments": "{}"}},  # 重复 id
+            ]},
+            {"role": "tool", "tool_call_id": "tc1", "content": "first"},
+            {"role": "tool", "tool_call_id": "tc1", "content": "second"},  # 重复 tool_call_id
+            {"role": "tool", "tool_call_id": "tc2", "content": "x"},
+        ]
+        original = [dict(m) for m in a._openai_messages]
+        with patch.object(
+            a._openai_client.chat.completions, "create",
+            new=AsyncMock(return_value=_FakeStream([])),
+        ) as mock_create:
+            asyncio.run(a._call_openai_stream())
+
+        sent = mock_create.call_args.kwargs["messages"]
+        # tool 消息：同 tool_call_id 只保留最先出现者
+        tool_msgs = [m for m in sent if m.get("role") == "tool"]
+        self.assertEqual([m["tool_call_id"] for m in tool_msgs], ["tc1", "tc2"])
+        self.assertEqual(tool_msgs[0]["content"], "first")
+        # assistant tool_calls：同 id 只保留首个
+        asst = [m for m in sent if m.get("role") == "assistant"]
+        self.assertEqual(len(asst), 1)
+        self.assertEqual([tc["id"] for tc in asst[0]["tool_calls"]], ["tc1", "tc2"])
+        # 原历史不被修改
+        self.assertEqual(a._openai_messages, original)
+        self.assertEqual(len([m for m in a._openai_messages if m.get("role") == "tool"]), 3)
+
+
 class TestCompactSummaryVersioning(unittest.TestCase):
     """Task 17: compact summary 记忆 name 带时间戳版本化，不再覆盖历史。"""
 
