@@ -49,3 +49,12 @@ def get_latest_session_id() -> str | None:
         return None
     sessions.sort(key=lambda s: s.get("startTime", ""), reverse=True)
     return sessions[0].get("id")
+
+
+def remove_session(session_id: str) -> None:
+    """删除会话文件（幂等：不存在时静默）。"""
+    path = SESSION_DIR / f"{session_id}.json"
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
