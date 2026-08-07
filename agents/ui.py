@@ -25,6 +25,35 @@ for _stream in (sys.stdout, sys.stderr):
 
 console = Console(highlight=False)
 
+# ─── 输出汇点（webui 模式用）────────────────────────────────
+# 有 sink 时，print_* 在保留终端输出的同时把结构化事件推给 sink（等价 nanobot 的
+# hook→bus→channel 事件链，agent 循环不知道浏览器存在）；无 sink 时行为与之前一致。
+_output_sink = None
+_sink_lock = threading.Lock()
+
+
+def set_output_sink(sink) -> None:
+    global _output_sink
+    with _sink_lock:
+        _output_sink = sink
+
+
+def clear_output_sink() -> None:
+    global _output_sink
+    with _sink_lock:
+        _output_sink = None
+
+
+def _emit(event: dict) -> None:
+    with _sink_lock:
+        sink = _output_sink
+    if sink is not None:
+        try:
+            sink(event)
+        except Exception:
+            pass  # sink 异常不影响终端输出
+
+
 # ─── Basic output ──────────────────────────────────────────
 
 
@@ -87,12 +116,21 @@ def print_user_prompt() -> None:
 
 
 def print_assistant_text(text: str) -> None:
+    _emit({"type": "assistant_text", "text": _safe_text(text)})
     _safe_stdout_write(text)
 
 
-def print_tool_call(name: str, inp: dict) -> None:
+def print_thinking(text: str) -> None:
+    """模型思考增量：webui 发独立 thinking 事件；终端淡色显示（不进 assistant_text 流）。"""
+    _emit({"type": "thinking", "text": _safe_text(text)})
+    # markup=False：模型输出是任意文本，rich 默认会把 [xxx] 当 markup 解析并抛 MarkupError
+    console.print(_safe_text(text), style="dim", end="", markup=False)
+
+
+def print_tool_call(name: str, inp: dict, duration: float | None = None) -> None:
     icon = _get_tool_icon(name)
     summary = _get_tool_summary(name, inp)
+    _emit({"type": "tool_call", "name": name, "summary": _safe_text(summary), "duration": duration})
     table = Table.grid(padding=(0, 1))
     table.add_column(style="bold yellow", no_wrap=True)
     table.add_column(style="white")
@@ -112,11 +150,13 @@ def print_tool_result(name: str, result: str) -> None:
     result = _safe_text(result)
     if (name in ("edit_file", "write_file")) and not result.startswith("Error"):
         _print_file_change_result(name, result)
+        _emit({"type": "file_change", "name": name, "text": result[:500]})
         return
     max_len = 500
     truncated = result
     if len(result) > max_len:
         truncated = result[:max_len] + f"\n  ... ({len(result)} chars total)"
+    _emit({"type": "tool_result", "name": name, "text": truncated})
     console.print(Panel(
         _safe_text(truncated),
         title=f"[dim]{name} result[/dim]",
@@ -156,6 +196,7 @@ def _print_file_change_result(_name: str, result: str) -> None:
 
 
 def print_error(msg: str) -> None:
+    _emit({"type": "error", "message": _safe_text(msg)})
     console.print(Panel(
         _safe_text(msg),
         title="[bold red]Error[/bold red]",
@@ -176,6 +217,7 @@ def print_confirmation(command: str) -> None:
 
 
 def print_divider() -> None:
+    _emit({"type": "turn_end"})
     console.rule("[dim]turn complete[/dim]", style="dim")
 
 
@@ -183,6 +225,7 @@ def print_cost(input_tokens: int, output_tokens: int) -> None:
     cost_in = (input_tokens / 1_000_000) * 3
     cost_out = (output_tokens / 1_000_000) * 15
     total = cost_in + cost_out
+    _emit({"type": "cost", "input_tokens": input_tokens, "output_tokens": output_tokens, "estimate": total})
     table = Table.grid(padding=(0, 2))
     table.add_column(style="cyan")
     table.add_column(style="white")
@@ -197,6 +240,7 @@ def print_retry(attempt: int, max_retries: int, reason: str) -> None:
 
 
 def print_info(msg: str) -> None:
+    _emit({"type": "info", "message": _safe_text(msg)})
     console.print(Panel(
         _safe_text(msg),
         title="[bold cyan]Info[/bold cyan]",
@@ -207,6 +251,7 @@ def print_info(msg: str) -> None:
 
 
 def print_warning(msg: str) -> None:
+    _emit({"type": "warning", "message": _safe_text(msg)})
     console.print(Panel(
         _safe_text(msg),
         title="[bold yellow]Notice[/bold yellow]",
@@ -219,6 +264,21 @@ def print_warning(msg: str) -> None:
 def print_verification(report: dict) -> None:
     """三层验证结果展示：PASS 绿色面板 / FAIL 红色面板，逐条列出规则状态。"""
     passed = bool(report.get("passed"))
+    _emit({
+        "type": "verification",
+        "passed": passed,
+        "total": int(report.get("total", 0) or 0),
+        "results": [
+            {
+                "id": str(r.get("id", "")),
+                "level": str(r.get("level", "")),
+                "type": str(r.get("type", "")),
+                "status": str(r.get("status", "")),
+                "detail": str(r.get("detail", "")),
+            }
+            for r in report.get("results", [])
+        ],
+    })
     color = "green" if passed else "red"
     lines = []
     for r in report.get("results", []):
@@ -259,6 +319,7 @@ def start_spinner(label: str = "Thinking") -> None:
     global _spinner_thread
     if _spinner_thread is not None:
         return
+    _emit({"type": "status", "status": "thinking", "label": label})
     _spinner_stop.clear()
 
     def _run() -> None:
@@ -280,6 +341,7 @@ def stop_spinner() -> None:
     _spinner_stop.set()
     _spinner_thread.join(timeout=1)
     _spinner_thread = None
+    _emit({"type": "status", "status": "done"})
     _safe_stdout_write("\r\033[K")
 
 

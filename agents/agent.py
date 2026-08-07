@@ -2086,9 +2086,9 @@ class Agent:
                         elif hasattr(delta, 'thinking'):
                             if first_text:
                                 stop_spinner()
-                                self._emit_text("\n  [thinking] ")
+                                print_thinking("\n  [thinking] ")
                                 first_text = False
-                            self._emit_text(delta.thinking)
+                            print_thinking(delta.thinking)
                         #第三种，工具参数 JSON 片段：工具调用的参数不是一次性返回，
                         # 而是一段一段返回，所以这里不断拼接到 input_json。
                         elif hasattr(delta, 'partial_json'):
